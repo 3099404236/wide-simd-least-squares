@@ -92,7 +92,9 @@ public:
                              const MatrixLeastSquaresLayoutData &layout) {
         this->m = layout.m;
         this->n = layout.n;
+        this->kTot = layout.k;
         this->k = layout.k;
+        this->helpers = (layout.helpers > 1) ? layout.helpers : 1;
         this->batch_size = layout.batch_size;
         this->has_residuals = layout.has_residuals;
         this->b_has_batch = layout.b_has_batch;
@@ -105,18 +107,35 @@ public:
     }
 
     SIMD_FN inline void Process() {
-        if (m == 0 || n == 0 || k == 0 || batch_size == 0) return;
+        if (m == 0 || n == 0 || kTot == 0 || batch_size == 0) return;
         const uint32_t core = CoreId();
         const uint32_t cores = CoreCount();
         // Smallest tile whose outputs are whole 32 B blocks.
         uint32_t unit = 1;
-        while ((unit * n * k) % 8 != 0 || (has_residuals != 0 && (unit * k) % 8 != 0)) ++unit;
+        while ((unit * n * kTot) % 8 != 0 || (has_residuals != 0 && (unit * kTot) % 8 != 0)) ++unit;
         const uint32_t tiles = (batch_size + unit - 1) / unit;
-        if (core >= tiles) return;
+        // A tile goes to `helpers` cores; with more than one, each takes a share of the groups of 8 right-hand sides.
+        uint32_t firstTile = core;
+        uint32_t tileStride = cores;
+        if (helpers > 1) {
+            if (core >= tiles * helpers) return;
+            firstTile = core / helpers;
+            tileStride = cores / helpers;
+            const uint32_t groups = kTot / 8;
+            const uint32_t perCore = (groups + helpers - 1) / helpers;
+            const uint32_t g0 = (core % helpers) * perCore;
+            if (g0 >= groups) return;
+            rOff = 8 * g0;
+            k = 8 * (mls::Min(groups, g0 + perCore) - g0);
+        } else {
+            rOff = 0;
+            k = kTot;
+        }
+        if (firstTile >= tiles) return;
 
         M8 = mls::Pad8(m);
         N8 = mls::Pad8(n);
-        const uint64_t slot = 2ull * n * M8 + static_cast<uint64_t>(k) * M8 + static_cast<uint64_t>(k) * N8;
+        const uint64_t slot = 2ull * n * M8 + static_cast<uint64_t>(kTot) * M8 + static_cast<uint64_t>(kTot) * N8;
         wsAT = static_cast<uint64_t>(core) * slot;
         wsVF = wsAT + static_cast<uint64_t>(n) * M8;
         wsBT = wsVF + static_cast<uint64_t>(n) * M8;
@@ -130,7 +149,7 @@ public:
 
         const bool resident = PlanResident();
         const bool medium = !resident && PlanMedium();
-        for (uint32_t t = core; t < tiles; t += cores) {
+        for (uint32_t t = firstTile; t < tiles; t += tileStride) {
             const uint32_t b1 = mls::Min((t + 1) * unit, batch_size);
             for (uint32_t b = t * unit; b < b1; ++b) {
                 if (resident) {
@@ -671,6 +690,7 @@ private:
             const uint32_t acc = xb - 7 * cnt * M8;
 
             // --- r = B - A x0.
+            MLS_TRACE_HOOK(Phase("refine.res"));
             {
                 const uint32_t raw = kFree;  // two blocks of ra A^T rows, then their 12-bit halves
                 const uint32_t ahv = raw + 2 * ra * M8;
@@ -700,6 +720,7 @@ private:
             }
 
             // --- rh + rl = Sh + Sl (TwoSum), ||rh||^2.
+            MLS_TRACE_HOOK(Phase("refine.mid"));
             {
                 const uint32_t f = cnt * M8;
                 const uint32_t sh = acc + (flip ? f : 0), sl = acc + 2 * f, pp = acc + 3 * f, ee = acc + 4 * f;
@@ -724,6 +745,7 @@ private:
             }
 
             // --- g = A^T (rh + rl), accumulators after the r rows.
+            MLS_TRACE_HOOK(Phase("refine.grad"));
             {
                 const uint32_t gacc = rArr + 2 * cnt * M8;
                 const uint32_t raw = gacc + 8 * cnt * N8;  // two blocks of rc A rows
@@ -996,20 +1018,20 @@ private:
 
     SIMD_FN inline void SolveResident(uint32_t b) {
         const uint64_t aOff = static_cast<uint64_t>(b) * m * n;
-        const uint64_t bOff = (b_has_batch != 0) ? static_cast<uint64_t>(b) * m * k : 0;
+        const uint64_t bOff = ((b_has_batch != 0) ? static_cast<uint64_t>(b) * m * kTot : 0) + rOff;
 
         MLS_TRACE_HOOK(Phase("r.load"));
         // Long columns of A and B are transposed through the workspace while SPAD past the inputs is still free.
         const bool viaWs = (m > mls::kScalarTransposeRows);
         if (viaWs) {
             TransposeToRows(wsMem, wsAT, M8, aMem, aOff, m, n, n, M8, rQrT);
-            TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, k, M8, rQrT);
+            TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, kTot, M8, rQrT);
         }
         FenceA();
         Load(rAug, aMem[aOff], m, n, n, Wr);
-        Load(rAug + N8, bMem[bOff], m, k, k, Wr);
+        Load(rAug + N8, bMem[bOff], m, k, kTot, Wr);
         Load(rArow, aMem[aOff], m, n, n, N8);
-        Load(rBrow, bMem[bOff], m, k, k, K8);
+        Load(rBrow, bMem[bOff], m, k, kTot, K8);
         FenceA();
 
         MLS_TRACE_HOOK(Phase("r.qr"));
@@ -1058,27 +1080,33 @@ private:
         FenceA();
 
         MLS_TRACE_HOOK(Phase("r.output"));
-        const uint64_t xOff = static_cast<uint64_t>(b) * n * k;
-        if (k == 1) {
+        const uint64_t xOff = static_cast<uint64_t>(b) * n * kTot + rOff;
+        if (kTot == 1) {
             Store(solMem[xOff], rX0, 1, n, n, N8);
         } else {
             for (uint32_t c = 0; c < n; ++c) {
                 for (uint32_t r = 0; r < k; ++r) SWr(rRef + c * k + r, SRd(rX0 + r * N8 + c));
             }
             FenceA();
-            Store(solMem[xOff], rRef, 1, n * k, n * k, mls::Pad8(n * k));
+            if (k == kTot) {
+                Store(solMem[xOff], rRef, 1, n * k, n * k, mls::Pad8(n * k));
+            } else {
+                Store(solMem[xOff], rRef, n, k, kTot, k);  // k is a multiple of 8 here
+            }
         }
-        if (has_residuals != 0) Store(resMem[static_cast<uint64_t>(b) * k], mls::kRes, 1, k, k, mls::Pad8(k));
+        if (has_residuals != 0) {
+            Store(resMem[static_cast<uint64_t>(b) * kTot + rOff], mls::kRes, 1, k, k, mls::Pad8(k));
+        }
         FenceA();
     }
 
     SIMD_FN inline void SolveOne(uint32_t b) {
         const uint64_t aOff = static_cast<uint64_t>(b) * m * n;
-        const uint64_t bOff = (b_has_batch != 0) ? static_cast<uint64_t>(b) * m * k : 0;
+        const uint64_t bOff = ((b_has_batch != 0) ? static_cast<uint64_t>(b) * m * kTot : 0) + rOff;
 
         MLS_TRACE_HOOK(Phase("transpose"));
         TransposeToRows(wsMem, wsAT, M8, aMem, aOff, m, n, n, M8, kFree);
-        TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, k, M8, kFree);
+        TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, kTot, M8, kFree);
 
         MLS_TRACE_HOOK(Phase("qr"));
         FactorAndApply();
@@ -1102,7 +1130,7 @@ private:
 
     SIMD_FN inline void SolveMedium(uint32_t b) {
         const uint64_t aOff = static_cast<uint64_t>(b) * m * n;
-        const uint64_t bOff = (b_has_batch != 0) ? static_cast<uint64_t>(b) * m * k : 0;
+        const uint64_t bOff = ((b_has_batch != 0) ? static_cast<uint64_t>(b) * m * kTot : 0) + rOff;
         const uint32_t aug = kFree;
         const uint32_t T = aug + m * Wr;
         const uint32_t wacc = T + mChunk * Wr;
@@ -1111,7 +1139,7 @@ private:
         MLS_TRACE_HOOK(Phase("m.qr"));
         FenceA();
         Load(aug, aMem[aOff], m, n, n, Wr);
-        Load(aug + N8, bMem[bOff], m, k, k, Wr);
+        Load(aug + N8, bMem[bOff], m, k, kTot, Wr);
         FenceA();
         RowQR(aug, Wr, T, mChunk, wacc, wrow);
 
@@ -1142,7 +1170,7 @@ private:
 
         MLS_TRACE_HOOK(Phase("transpose"));
         TransposeToRows(wsMem, wsAT, M8, aMem, aOff, m, n, n, M8, kFree);
-        TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, k, M8, kFree);
+        TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, kTot, M8, kFree);
         rRowsInVf = true;
         FinishStreaming(b, aOff);
     }
@@ -1240,9 +1268,9 @@ private:
 
     // Solution [n][k] from the x rows in XT, and the residuals of the batch.
     SIMD_FN inline void WriteOutputs(uint32_t b) {
-        const uint64_t xOff = static_cast<uint64_t>(b) * n * k;
+        const uint64_t xOff = static_cast<uint64_t>(b) * n * kTot + rOff;
         const uint32_t avail = mls::kSpadFloats - kFree;
-        if (k == 1) {
+        if (kTot == 1) {
             const uint32_t buf = kFree;
             FenceA();
             Load(buf, wsMem[wsXT], 1, N8, N8, N8);
@@ -1263,12 +1291,16 @@ private:
                     for (uint32_t r = 0; r < k; ++r) SWr(xout + c * k + r, SRd(xin + r * rows + c));
                 }
                 FenceA();
-                Store(solMem[xOff + static_cast<uint64_t>(c0) * k], xout, 1, cr * k, cr * k, mls::Pad8(cr * k));
+                if (k == kTot) {
+                    Store(solMem[xOff + static_cast<uint64_t>(c0) * k], xout, 1, cr * k, cr * k, mls::Pad8(cr * k));
+                } else {
+                    Store(solMem[xOff + static_cast<uint64_t>(c0) * kTot], xout, cr, k, kTot, k);
+                }
             }
         }
         if (has_residuals != 0) {
             FenceA();
-            Store(resMem[static_cast<uint64_t>(b) * k], mls::kRes, 1, k, k, mls::Pad8(k));
+            Store(resMem[static_cast<uint64_t>(b) * kTot + rOff], mls::kRes, 1, k, k, mls::Pad8(k));
         }
         FenceA();
     }
@@ -1286,7 +1318,8 @@ private:
         FenceA();
     }
 
-    uint32_t m = 0, n = 0, k = 0, batch_size = 0, has_residuals = 0, b_has_batch = 0;
+    // k: right-hand sides this core solves (columns rOff.. of B); kTot: all of them.
+    uint32_t m = 0, n = 0, k = 0, kTot = 0, rOff = 0, helpers = 1, batch_size = 0, has_residuals = 0, b_has_batch = 0;
     MemRef<float> aMem, bMem, solMem, resMem, wsMem;
 
     uint32_t M8 = 0, N8 = 0, K8 = 0, Wr = 0, kTau = 0, kFree = 0;

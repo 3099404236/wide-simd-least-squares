@@ -156,7 +156,8 @@ void Reference(const float *a, const float *b, int m, int n, int k, std::vector<
 
 // ---------------------------------------------------------------- host workspace size (mirrors host/matrix_least_squares.cpp)
 
-size_t HostWorkspaceFloats(uint32_t m, uint32_t n, uint32_t k, uint32_t batch_size, uint32_t num_simd_cores) {
+size_t HostWorkspaceFloats(uint32_t m, uint32_t n, uint32_t k, uint32_t batch_size, uint32_t num_simd_cores,
+                           uint32_t *helpersOut) {
     const size_t big_dim = (m >= n) ? m : n;
     const size_t small_dim = (m >= n) ? n : m;
     const size_t main_slot = 2 * small_dim * (((big_dim + 7) / 8) * 8) + static_cast<size_t>(k) * (((m + 7) / 8) * 8) +
@@ -164,7 +165,15 @@ size_t HostWorkspaceFloats(uint32_t m, uint32_t n, uint32_t k, uint32_t batch_si
     uint32_t unit = 1;
     while ((static_cast<uint64_t>(unit) * n * k) % 8 != 0) ++unit;
     const size_t tiles = (static_cast<size_t>(batch_size) + unit - 1) / unit;
-    const size_t working = (tiles < static_cast<size_t>(num_simd_cores)) ? tiles : static_cast<size_t>(num_simd_cores);
+    uint32_t helpers = 1;
+    if (k % 8 == 0 && tiles < static_cast<size_t>(num_simd_cores)) {
+        const size_t perTile = static_cast<size_t>(num_simd_cores) / tiles;
+        helpers = static_cast<uint32_t>((perTile < k / 8) ? perTile : k / 8);
+        if (helpers < 1) helpers = 1;
+    }
+    *helpersOut = helpers;
+    const size_t cells = tiles * helpers;
+    const size_t working = (cells < static_cast<size_t>(num_simd_cores)) ? cells : static_cast<size_t>(num_simd_cores);
     size_t ws_floats = working * main_slot;
     const size_t big_pad = ((big_dim + 7) / 8) * 8;
     const size_t small_pad = ((small_dim + 7) / 8) * 8;
@@ -246,13 +255,14 @@ Result RunCase(const Case &cs, bool verbose) {
     uint8_t *gb = simemu::AllocRegion(b.size() * 4, "B");
     uint8_t *gx = simemu::AllocRegion(static_cast<size_t>(batch) * n * k * 4, "solution");
     uint8_t *gr = has_res ? simemu::AllocRegion(static_cast<size_t>(batch) * k * 4, "residuals") : nullptr;
-    const size_t ws = HostWorkspaceFloats(m, n, k, batch, cs.cores);
+    uint32_t helpers = 1;
+    const size_t ws = HostWorkspaceFloats(m, n, k, batch, cs.cores, &helpers);
     uint8_t *gw = simemu::AllocRegion(ws * 4, "workspace");
     std::memcpy(ga, a.data(), a.size() * 4);
     std::memcpy(gb, b.data(), b.size() * 4);
     MatrixLeastSquaresLayoutData layout{static_cast<uint32_t>(m), static_cast<uint32_t>(n), static_cast<uint32_t>(k),
                                         static_cast<uint32_t>(batch), has_res ? 1u : 0u,
-                                        static_cast<uint32_t>(b_has_batch)};
+                                        static_cast<uint32_t>(b_has_batch), helpers};
     Result r;
     tracechk::St().hazards = 0;
     tracechk::St().reports = 0;

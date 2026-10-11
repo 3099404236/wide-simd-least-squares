@@ -86,9 +86,9 @@ namespace kernel_layout {
 
         context->SetParallelUnits(num_simd_cores);
 
-        // The main kernel gives each working core a workspace slot: C^T and its factor (N rows of Pad8(M) floats each,
-        // with M = max(m, n), N = min(m, n)), then B^T (k rows of Pad8(m)) and X^T (k rows of Pad8(n)). Batches go out in
-        // tiles whose outputs are whole 32 B blocks, so only min(cores, tiles) cores work.
+        // The kernel gives each working core a workspace slot: A^T and its factor (N rows of Pad8(M) floats each, with
+        // M = max(m, n), N = min(m, n)), then B^T (k rows of Pad8(m)) and X^T (k rows of Pad8(n)). Batches go out in
+        // tiles whose outputs are whole 32 B blocks; a tile is solved by `helpers` cores (see below).
         const size_t big_dim = (m >= n) ? m : n;
         const size_t small_dim = (m >= n) ? n : m;
         const size_t main_slot = 2 * small_dim * (((big_dim + 7) / 8) * 8) + static_cast<size_t>(k) * (((m + 7) / 8) * 8) +
@@ -97,7 +97,18 @@ namespace kernel_layout {
         uint32_t unit = 1;
         while ((static_cast<uint64_t>(unit) * n * k) % 8 != 0) ++unit;
         const size_t tiles = (static_cast<size_t>(batch_size) + unit - 1) / unit;
-        const size_t working = (tiles < static_cast<size_t>(num_simd_cores)) ? tiles : static_cast<size_t>(num_simd_cores);
+        // When there are fewer tiles than cores and the right-hand sides split into groups of 8 (whole 32 B blocks of
+        // both outputs), the idle cores help: each core of a tile redoes the QR of A and solves a share of the
+        // right-hand sides. Every working core gets its own workspace slot.
+        uint32_t helpers = 1;
+        if (k % 8 == 0 && tiles < static_cast<size_t>(num_simd_cores)) {
+            const size_t perTile = static_cast<size_t>(num_simd_cores) / tiles;
+            helpers = static_cast<uint32_t>((perTile < k / 8) ? perTile : k / 8);
+            if (helpers < 1) helpers = 1;
+        }
+        tiling->helpers = helpers;
+        const size_t cells = tiles * helpers;
+        const size_t working = (cells < static_cast<size_t>(num_simd_cores)) ? cells : static_cast<size_t>(num_simd_cores);
         size_t ws_floats = working * main_slot;
         // The legacy kernel runs when KernelMatrixLeastSquares::Plan() finds no room in SPAD (same test: more right-hand
         // sides than Pad8(M), or 13 vectors of Pad8(M) plus 10 of Pad8(N) and 1472 floats of staging over 46000 floats).
