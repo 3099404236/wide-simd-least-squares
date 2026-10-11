@@ -1348,9 +1348,9 @@ private:
 };
 
 template <typename DT_A>
-SIMD_ENTRY SIMD_FN void matrix_least_squares(MemAddr A, MemAddr B, MemAddr solution, MemAddr residuals, MemAddr workspace, MemAddr tiling) {
+SIMD_ENTRY SIMD_FN void matrix_least_squares(MemAddr A, MemAddr B, MemAddr solution, MemAddr residuals, MemAddr workspace, MemAddr layout_arg) {
     REGISTER_LAYOUT_DEFAULT(MatrixLeastSquaresLayoutData);
-    ACQUIRE_LAYOUT_STRUCT(MatrixLeastSquaresLayoutData, layout_data, tiling);
+    ACQUIRE_LAYOUT_STRUCT(MatrixLeastSquaresLayoutData, layout_data, layout_arg);
     KernelMatrixLeastSquares<DT_A> op;
     op.Init(A, B, solution, residuals, workspace, layout_data);
     op.Process();

@@ -34,7 +34,7 @@ namespace simemu {
 constexpr size_t kSpadBytes = 195584;
 constexpr size_t kVecBytes = 256;
 // Limits the verified kernels respect on the device, enforced here as faults: vector instructions bounded by SPAD size
-// (matrix_linear_solve: "单次向量 mask 安全上限"), no single block copy over 32 KB.
+// Upper bound on single SIMD vector mask, no single block copy over 32 KB.
 constexpr size_t kVecMaxElems = 65536;
 constexpr size_t kDmaMaxBytes = 196608;
 
@@ -51,16 +51,16 @@ struct Counters {
 
 struct Faults {
     uint64_t spad_misalign = 0;   // block copy with a SPAD address off a 32 B boundary
-    uint64_t gm_misalign = 0;     // block copy with an EXTMEM address off a 32 B boundary (allowed, counted)
+    uint64_t ext_misalign = 0;    // block copy with an EXTMEM address off a 32 B boundary (allowed, counted)
     uint64_t vec_misalign = 0;    // vector operand off a 32 B boundary
     uint64_t spad_oob = 0;        // access outside the reserved block
-    uint64_t gm_oob = 0;          // block copy outside a registered EXTMEM buffer
+    uint64_t ext_oob = 0;         // block copy outside a registered EXTMEM buffer
     uint64_t write_conflict = 0;  // two cores wrote the same 32 B block of EXTMEM
     uint64_t spad_overflow = 0;   // ReserveBlock past the SPAD capacity
     uint64_t vec_long = 0;        // vector instruction over kVecMaxElems elements
     uint64_t dma_large = 0;       // block copy over kDmaMaxBytes
     uint64_t total() const {
-        return spad_misalign + vec_misalign + spad_oob + gm_oob + write_conflict + spad_overflow + vec_long + dma_large;
+        return spad_misalign + vec_misalign + spad_oob + ext_oob + write_conflict + spad_overflow + vec_long + dma_large;
     }
 };
 
@@ -135,7 +135,11 @@ inline bool InSpad(const void *p) {
 
 namespace hpc {
 
+#if defined(__FLT16_MANT_DIG__)
 using f16 = _Float16;
+#else
+using f16 = float;
+#endif
 
 enum class BufferLocation { WORK, VECIN, VECOUT, VECCALC };
 enum class Rounding { ROUND_NONE, ROUND_NEAREST, ROUND_FLOOR, ROUND_CEIL, ROUND_TRUNC };
@@ -280,26 +284,26 @@ inline void CheckSpadOperand(const Scratch<T> &s, uint64_t count, bool dma) {
     }
 }
 
-inline void CheckGm(const uint8_t *p, uint64_t bytes, bool write) {
+inline void CheckExtMem(const uint8_t *p, uint64_t bytes, bool write) {
     if (bytes > simemu::kDmaMaxBytes) {
         ++simemu::g_faults.dma_large;
         simemu::Report("dma_large", "block copy over 32 KB");
     }
     simemu::Region *r = simemu::FindRegion(p);
     if (r == nullptr || p + bytes > r->base + r->cap) {
-        ++simemu::g_faults.gm_oob;
-        simemu::Report("gm_oob", "block copy outside a registered EXTMEM buffer");
+        ++simemu::g_faults.ext_oob;
+        simemu::Report("ext_oob", "block copy outside a registered EXTMEM buffer");
         std::abort();
     }
     if (p + bytes > r->base + r->bytes) {
         // Past the logical end, inside the allocation padding: harmless for a read, corrupts a neighbour for a write.
         if (write) {
-            ++simemu::g_faults.gm_oob;
-            simemu::Report("gm_oob", "block copy writes past the end of an EXTMEM tensor");
+            ++simemu::g_faults.ext_oob;
+            simemu::Report("ext_oob", "block copy writes past the end of an EXTMEM tensor");
         }
     }
     const uint64_t off = static_cast<uint64_t>(p - r->base);
-    if (off % 32 != 0) ++simemu::g_faults.gm_misalign;
+    if (off % 32 != 0) ++simemu::g_faults.ext_misalign;
     if (write && bytes > 0) {
         for (uint64_t blk = off / 32; blk <= (off + bytes - 1) / 32; ++blk) {
             int16_t &o = r->owner[blk];
@@ -342,7 +346,7 @@ inline void BlockCopyPartial(const Scratch<T> &dst, const MemRef<T> &src, const 
     for (uint32_t b = 0; b < prm.blockCount; ++b) {
         const uint8_t *sb = s + b * (len + prm.srcStride);
         uint8_t *db = d + b * (dst_blk + prm.dstStride * 32);
-        detail::CheckGm(sb, len, false);
+        detail::CheckExtMem(sb, len, false);
         std::memcpy(db, sb, len);
         T *tail = reinterpret_cast<T *>(db + len);
         const uint64_t tail_n = (dst_blk - len) / sizeof(T);
@@ -376,7 +380,7 @@ inline void BlockCopyPartial(const MemRef<T> &dst, const Scratch<T> &src, const 
     for (uint32_t b = 0; b < prm.blockCount; ++b) {
         uint8_t *db = d + b * (len + prm.dstStride);
         const uint8_t *sb = s + b * (src_blk + prm.srcStride * 32);
-        detail::CheckGm(db, len, true);
+        detail::CheckExtMem(db, len, true);
         std::memcpy(db, sb, len);
     }
 }

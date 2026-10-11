@@ -56,7 +56,7 @@ wide-simd-least-squares/
 │   └── simd_machine.hpp                   # SIMD machine API definition (192KB SPAD), CPU simulator
 ├── kernel/
 │   ├── matrix_least_squares.cpp           # Kernel implementation
-│   ├── matrix_least_squares_layout.h      # Layout/Tiling configuration struct
+│   ├── matrix_least_squares_layout.h      # Workload layout configuration struct
 │   └── layout_key_matrix_least_squares.h  # Template argument selector
 ├── host/
 │   └── matrix_least_squares.cpp           # Host layout & workspace calculation

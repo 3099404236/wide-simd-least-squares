@@ -1,4 +1,4 @@
-// Host侧Tiling实现 —— MatrixLeastSquares
+// Host-side Layout Configuration - MatrixLeastSquares
 #include "interface/operator_registry.hpp"
 #include "interface/platform_hardware.hpp"
 
@@ -76,13 +76,13 @@ namespace kernel_layout {
         uint32_t DT_A = static_cast<uint32_t>(dtype_A);
         SIMD_TPL_SELECT_PARAM(context, DT_A);
 
-        MatrixLeastSquaresLayoutData *tiling = context->GetLayoutConfig<MatrixLeastSquaresLayoutData>();
-        tiling->m = m;
-        tiling->n = n;
-        tiling->k = k;
-        tiling->batch_size = batch_size;
-        tiling->has_residuals = (m > n) ? 1 : 0;
-        tiling->b_has_batch = b_has_batch;
+        MatrixLeastSquaresLayoutData *layout_cfg = context->GetLayoutConfig<MatrixLeastSquaresLayoutData>();
+        layout_cfg->m = m;
+        layout_cfg->n = n;
+        layout_cfg->k = k;
+        layout_cfg->batch_size = batch_size;
+        layout_cfg->has_residuals = (m > n) ? 1 : 0;
+        layout_cfg->b_has_batch = b_has_batch;
 
         context->SetParallelUnits(num_simd_cores);
 
@@ -106,7 +106,7 @@ namespace kernel_layout {
             helpers = static_cast<uint32_t>((perTile < k / 8) ? perTile : k / 8);
             if (helpers < 1) helpers = 1;
         }
-        tiling->helpers = helpers;
+        layout_cfg->helpers = helpers;
         const size_t cells = tiles * helpers;
         const size_t working = (cells < static_cast<size_t>(num_simd_cores)) ? cells : static_cast<size_t>(num_simd_cores);
         size_t ws_floats = working * main_slot;

@@ -32,7 +32,7 @@ struct Cell {
     uint32_t rGen[4] = {0, 0, 0, 0};  // 0: no pending read by that unit
 };
 
-struct GmShadow {
+struct ExtMemShadow {
     const uint8_t *base = nullptr;
     size_t floats = 0;
     std::vector<uint32_t> wGen;  // pending SPAD -> EXTMEM write
@@ -42,7 +42,7 @@ struct GmShadow {
 struct State {
     uint32_t gen[4] = {1, 1, 1, 1};
     std::vector<Cell> spad;
-    std::vector<GmShadow> gm;
+    std::vector<ExtMemShadow> ext_regions;
     uint64_t hazards = 0;
     int reports = 0;
     std::string phase;
@@ -90,14 +90,14 @@ inline void BeginCore() {
     State &s = St();
     for (auto &g : s.gen) g = 1;
     s.spad.assign(simemu::kSpadBytes / 4, Cell());
-    s.gm.clear();
+    s.ext_regions.clear();
     for (const auto &r : simemu::g_regions) {
-        GmShadow g;
+        ExtMemShadow g;
         g.base = r.base;
         g.floats = r.cap / 4;
         g.wGen.assign(g.floats, 0);
         g.rGen.assign(g.floats, 0);
-        s.gm.push_back(std::move(g));
+        s.ext_regions.push_back(std::move(g));
     }
     s.phase.clear();
     s.phaseCost.clear();
@@ -142,15 +142,15 @@ inline void Spad(int u, uint32_t w, uint32_t wn, uint32_t r0, uint32_t r1, uint3
     }
 }
 
-inline GmShadow *FindGm(const uint8_t *p) {
-    for (auto &g : St().gm) {
+inline ExtMemShadow *FindExtMem(const uint8_t *p) {
+    for (auto &g : St().ext_regions) {
         if (p >= g.base && p < g.base + g.floats * 4) return &g;
     }
     return nullptr;
 }
 
-inline void Gm(int u, const uint8_t *p, uint32_t bytes, bool write) {
-    GmShadow *g = FindGm(p);
+inline void TraceExtMem(int u, const uint8_t *p, uint32_t bytes, bool write) {
+    ExtMemShadow *g = FindExtMem(p);
     if (g == nullptr) return;
     const size_t f0 = static_cast<size_t>(p - g->base) / 4;
     const size_t f1 = (static_cast<size_t>(p - g->base) + bytes + 3) / 4;
@@ -210,7 +210,7 @@ void DmaIn(uint32_t dst, const void *src, const BlockCopyParams &prm) {
     const uint32_t dstBlk = (len + 31) / 32 * 32;
     const uint8_t *s = static_cast<const uint8_t *>(src);
     for (uint32_t b = 0; b < prm.blockCount; ++b) {
-        tracechk::Gm(tracechk::kDI, s + static_cast<uint64_t>(b) * (len + prm.srcStride), len, false);
+        tracechk::TraceExtMem(tracechk::kDI, s + static_cast<uint64_t>(b) * (len + prm.srcStride), len, false);
         const uint32_t d = dst + b * (dstBlk + prm.dstStride * 32) / 4;
         tracechk::Spad(tracechk::kDI, d, dstBlk / 4, 0xFFFFFFFFu, 0xFFFFFFFFu, 0);
     }
@@ -223,7 +223,7 @@ void DmaOut(const void *dst, uint32_t src, const BlockCopyParams &prm) {
     for (uint32_t b = 0; b < prm.blockCount; ++b) {
         const uint32_t s = src + b * (srcBlk + prm.srcStride * 32) / 4;
         tracechk::Spad(tracechk::kDO, 0xFFFFFFFFu, 0, s, 0xFFFFFFFFu, (len + 3) / 4);
-        tracechk::Gm(tracechk::kDO, d + static_cast<uint64_t>(b) * (len + prm.dstStride), len, true);
+        tracechk::TraceExtMem(tracechk::kDO, d + static_cast<uint64_t>(b) * (len + prm.dstStride), len, true);
     }
 }
 
