@@ -61,6 +61,9 @@ constexpr uint32_t kSpadFloats = kSpadBytes / 4;
 constexpr uint32_t kMaxBlockCols = 64;  // columns per QR block (bounded by the scalar scratch below)
 constexpr uint32_t kMaxRhsGroup = 64;   // right-hand sides per refinement group
 constexpr uint32_t kNone = 0xFFFFFFFFu;
+// Transposes of at most this many rows go through the scalar unit (2 accesses of a few cycles per element) rather than
+// 4-byte block copies (two copies and a global fence per column, several hundred cycles).
+constexpr uint32_t kScalarTransposeRows = 128;
 constexpr float kSplit = 4097.0f;  // 2^12 + 1: Veltkamp split of a float into two 12-bit halves
 
 // Persistent SPAD area (float offsets).
@@ -241,10 +244,27 @@ private:
     }
 
     // Transposes `cols` columns of a row-major matrix (`rows` x `ld`, starting at element `src`) into rows of `len`
-    // floats (len >= rows, zero tail) at `dst`, `dstStride` floats apart. Uses 2 spread buffers of 8 * len floats.
+    // floats (len >= rows, zero tail) at `dst`, `dstStride` floats apart. Short columns go through SPAD and the scalar
+    // unit (2 rows * cols accesses and two block copies); long ones through EXTMEM, one column at a time, with two
+    // 4-byte-block copies each (2 spread buffers of 8 * len floats at `buf`).
     SIMD_FN inline void TransposeToRows(const MemRef<float> &dstMem, uint64_t dst, uint64_t dstStride,
                                         const MemRef<float> &srcMem, uint64_t src, uint32_t rows, uint32_t cols,
                                         uint32_t ld, uint32_t len, uint32_t buf) {
+        const uint32_t ldp = mls::Pad8(cols);
+        if (rows <= mls::kScalarTransposeRows && rows * ldp + cols * len <= mls::kSpadFloats - buf) {
+            const uint32_t out = buf + rows * ldp;
+            FenceA();
+            Load(buf, srcMem[src], rows, cols, ld, ldp);
+            VFill(out, 0.0f, cols * len);
+            FenceA();
+            for (uint32_t c = 0; c < cols; ++c) {
+                for (uint32_t i = 0; i < rows; ++i) SWr(out + c * len + i, SRd(buf + i * ldp + c));
+            }
+            FenceA();
+            Store(dstMem[dst], out, cols, len, dstStride, len);
+            FenceA();
+            return;
+        }
         const uint32_t spreadLen = 8 * len;
         FenceA();
         VFill(buf, 0.0f, 2 * spreadLen);
@@ -492,64 +512,44 @@ private:
     // and E, a * y_r and the TwoSum error enter Sl, so Sl only ever holds terms below 2^-24 of the products and the
     // pair keeps about 45 bits; folding the 2^-12 partial products into Sl instead would stop near 36 bits, which is
     // not enough for A^T r (its error reaches x multiplied by cond(A)^2).
-    // Accumulator r: base + r * rows * len, rows = 8 (7 without y): {Sh, S2 (roles swap through `flip`), Sl, P, E, T,
-    // W, Q}.
+    // Accumulators are stored by field: field f of all cnt right-hand sides is the contiguous run
+    // base + f * cnt * len (row r at + r * len), so only the products by per-row scalars take one instruction per
+    // right-hand side. Fields: 0 Sh, 1 S2 (the two swap roles through `flip`), 2 Sl, 3 P, 4 E, 5 T, 6 W, 7 Q (with y).
     SIMD_FN inline void Dot2(uint32_t a, uint32_t ah, uint32_t al, uint32_t base, uint32_t cnt, uint32_t len,
                              bool withY) {
-        const uint32_t rows = withY ? 8 : 7;
-        const uint32_t sh = flip ? len : 0;
-        const uint32_t s2 = flip ? 0 : len;
-        const uint32_t sl = 2 * len, pp = 3 * len, ee = 4 * len, tt = 5 * len, ww = 6 * len, qq = 7 * len;
+        const uint32_t f = cnt * len;
+        const uint32_t sh = base + (flip ? f : 0);
+        const uint32_t s2 = base + (flip ? 0 : f);
+        const uint32_t sl = base + 2 * f, pp = base + 3 * f, ee = base + 4 * f, tt = base + 5 * f, ww = base + 6 * f;
+        const uint32_t qq = base + 7 * f;
         for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VMulS(b + pp, a, dx[r], len);    // P = fl(a x)
-            VMulS(b + ee, ah, dxh[r], len);  // ah xh
-            VMulS(b + tt, ah, dxl[r], len);  // ah xl
-            if (withY) VMulS(b + qq, a, dy[r], len);
+            VMulS(pp + r * len, a, dx[r], len);    // P = fl(a x)
+            VMulS(ee + r * len, ah, dxh[r], len);  // ah xh
+            VMulS(tt + r * len, ah, dxl[r], len);  // ah xl
+            if (withY) VMulS(qq + r * len, a, dy[r], len);
         }
         FenceV();
-        for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VSub(b + ee, b + ee, b + pp, len);  // E = ah xh - P
-            VAdd(b + s2, b + sh, b + pp, len);  // s = Sh + P
-            if (withY) VAdd(b + sl, b + sl, b + qq, len);
-        }
+        VSub(ee, ee, pp, f);  // E = ah xh - P
+        VAdd(s2, sh, pp, f);  // s = Sh + P
+        if (withY) VAdd(sl, sl, qq, f);
         FenceV();
-        for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VAdd(b + ee, b + ee, b + tt, len);  // E += ah xl
-            VSub(b + ww, b + s2, b + sh, len);  // bb = s - Sh
-        }
+        VAdd(ee, ee, tt, f);  // E += ah xl
+        VSub(ww, s2, sh, f);  // bb = s - Sh
         FenceV();
-        for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VMulS(b + tt, al, dxh[r], len);     // al xh
-            VSub(b + pp, b + pp, b + ww, len);  // P - bb
-        }
+        for (uint32_t r = 0; r < cnt; ++r) VMulS(tt + r * len, al, dxh[r], len);  // al xh
+        VSub(pp, pp, ww, f);                                                     // P - bb
         FenceV();
-        for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VAdd(b + ee, b + ee, b + tt, len);  // E += al xh
-            VSub(b + ww, b + s2, b + ww, len);  // s - bb
-        }
+        VAdd(ee, ee, tt, f);  // E += al xh
+        VSub(ww, s2, ww, f);  // s - bb
         FenceV();
-        for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VMulS(b + tt, al, dxl[r], len);     // al xl
-            VSub(b + ww, b + sh, b + ww, len);  // Sh - (s - bb)
-            VAdd(b + sl, b + sl, b + pp, len);  // Sl += P - bb
-        }
+        for (uint32_t r = 0; r < cnt; ++r) VMulS(tt + r * len, al, dxl[r], len);  // al xl
+        VSub(ww, sh, ww, f);                                                     // Sh - (s - bb)
+        VAdd(sl, sl, pp, f);                                                     // Sl += P - bb
         FenceV();
-        for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VAdd(b + ee, b + ee, b + tt, len);  // E += al xl: the exact error of P
-            VAdd(b + sl, b + sl, b + ww, len);  // Sl += Sh - (s - bb)
-        }
+        VAdd(ee, ee, tt, f);  // E += al xl: the exact error of P
+        VAdd(sl, sl, ww, f);  // Sl += Sh - (s - bb)
         FenceV();
-        for (uint32_t r = 0; r < cnt; ++r) {
-            const uint32_t b = base + r * rows * len;
-            VAdd(b + sl, b + sl, b + ee, len);  // Sl += E
-        }
+        VAdd(sl, sl, ee, f);  // Sl += E
         FenceV();
         flip = !flip;
     }
@@ -580,9 +580,9 @@ private:
     //   g = A^T (rh + rl) over N8-long vectors (A rows from the input), written over the B^T rows.
     // Both in Dot2 double-float. Rounding r to float32 before forming g would leave an error A^+ (r - fl(r)) in x, up
     // to cond(A) * eps * ||r||, so r stays in two parts.
-    // SPAD of a group of c right-hand sides: rh and rl rows (2c x M8), then either the residual accumulators (7c x M8),
-    // two blocks of ra A^T rows, their 12-bit halves and the x0 rows (c x N8), or the gradient accumulators (8c x N8),
-    // two blocks of rc A rows and their 12-bit halves.
+    // SPAD of a group of c right-hand sides: rh and rl rows (2c x M8), then either the residual accumulators (7 fields
+    // of c x M8), two blocks of ra A^T rows, their 12-bit halves and the x0 rows (c x N8), or the gradient accumulators
+    // (8 fields of c x N8), two blocks of rc A rows and their 12-bit halves.
     SIMD_FN inline void RefinePass(uint64_t aOff) {
         const uint32_t avail = mls::kSpadFloats - kFree;
         uint32_t kg = mls::Min(k, mls::kMaxRhsGroup);
@@ -609,7 +609,7 @@ private:
                 FenceA();
                 VFill(acc, 0.0f, 7 * cnt * M8);
                 FenceA();
-                Load(acc, wsMem[wsBT + static_cast<uint64_t>(r0) * M8], cnt, M8, M8, 7 * M8);
+                Load(acc, wsMem[wsBT + static_cast<uint64_t>(r0) * M8], cnt, M8, M8, M8);
                 Load(xb, wsMem[wsXT + static_cast<uint64_t>(r0) * N8], 1, cnt * N8, N8, N8);
                 Load(raw, wsMem[wsAT], 1, mls::Min(ra, n) * M8, M8, M8);
                 flip = false;
@@ -632,37 +632,25 @@ private:
 
             // --- rh + rl = Sh + Sl (TwoSum), ||rh||^2.
             {
-                const uint32_t sh = flip ? M8 : 0, sl = 2 * M8, pp = 3 * M8, ee = 4 * M8, tt = 5 * M8;
-                for (uint32_t r = 0; r < cnt; ++r) {
-                    const uint32_t b = acc + r * 7 * M8;
-                    VAdd(rArr + r * M8, b + sh, b + sl, M8);  // rh
-                }
+                const uint32_t f = cnt * M8;
+                const uint32_t sh = acc + (flip ? f : 0), sl = acc + 2 * f, pp = acc + 3 * f, ee = acc + 4 * f;
+                const uint32_t tt = acc + 5 * f;
+                const uint32_t rh = rArr, rl = rArr + f;
+                VAdd(rh, sh, sl, f);
                 FenceV();
-                for (uint32_t r = 0; r < cnt; ++r) {
-                    const uint32_t b = acc + r * 7 * M8;
-                    VSub(b + pp, rArr + r * M8, b + sh, M8);         // bb = rh - Sh
-                    VMul(b + tt, rArr + r * M8, rArr + r * M8, M8);  // rh^2
-                }
+                VSub(pp, rh, sh, f);  // bb = rh - Sh
+                VMul(tt, rh, rh, f);  // rh^2
                 FenceV();
-                for (uint32_t r = 0; r < cnt; ++r) {
-                    const uint32_t b = acc + r * 7 * M8;
-                    VSub(b + ee, rArr + r * M8, b + pp, M8);  // rh - bb
-                    VSub(b + sl, b + sl, b + pp, M8);         // Sl - bb
-                }
+                VSub(ee, rh, pp, f);  // rh - bb
+                VSub(sl, sl, pp, f);  // Sl - bb
                 FenceV();
-                if (has_residuals != 0) Halve(acc + tt, 7 * M8, 0, cnt, M8);
-                for (uint32_t r = 0; r < cnt; ++r) {
-                    const uint32_t b = acc + r * 7 * M8;
-                    VSub(b + ee, b + sh, b + ee, M8);  // Sh - (rh - bb)
-                }
+                if (has_residuals != 0) Halve(tt, M8, 0, cnt, M8);
+                VSub(ee, sh, ee, f);  // Sh - (rh - bb)
                 FenceV();
                 if (has_residuals != 0) {
-                    for (uint32_t r = 0; r < cnt; ++r) SWr(mls::kRes + r0 + r, LaneSum(acc + r * 7 * M8 + tt));
+                    for (uint32_t r = 0; r < cnt; ++r) SWr(mls::kRes + r0 + r, LaneSum(tt + r * M8));
                 }
-                for (uint32_t r = 0; r < cnt; ++r) {
-                    const uint32_t b = acc + r * 7 * M8;
-                    VAdd(rArr + (cnt + r) * M8, b + ee, b + sl, M8);  // rl
-                }
+                VAdd(rl, ee, sl, f);
                 FenceV();
             }
 
@@ -692,13 +680,10 @@ private:
                         Dot2(cur + i * N8, ahv + i * N8, alv + i * N8, acc, cnt, N8, true);
                     }
                 }
-                const uint32_t sh = flip ? N8 : 0;
-                for (uint32_t r = 0; r < cnt; ++r) {
-                    const uint32_t b = acc + r * 8 * N8;
-                    VAdd(b + 3 * N8, b + sh, b + 2 * N8, N8);  // g = Sh + Sl into the P slot
-                }
+                const uint32_t f = cnt * N8;
+                VAdd(acc + 3 * f, acc + (flip ? f : 0), acc + 2 * f, f);  // g = Sh + Sl into the P field
                 FenceA();
-                Store(wsMem[wsBT + static_cast<uint64_t>(r0) * M8], acc + 3 * N8, cnt, N8, M8, 8 * N8);
+                Store(wsMem[wsBT + static_cast<uint64_t>(r0) * M8], acc + 3 * f, cnt, N8, M8, N8);
                 FenceA();
             }
         }
@@ -741,7 +726,19 @@ private:
 
         // R^T rows (zero left of and on the diagonal) into AT, N8 apart: row i takes VF[j][i] for j > i.
         MLS_TRACE_HOOK(Phase("rtranspose"));
-        {
+        if (n <= mls::kScalarTransposeRows && 2 * n * N8 <= avail) {
+            const uint32_t rc = kFree, rt = rc + n * N8;
+            FenceA();
+            Load(rc, wsMem[wsVF], n, N8, M8, N8);
+            VFill(rt, 0.0f, n * N8);
+            FenceA();
+            for (uint32_t i = 0; i + 1 < n; ++i) {
+                for (uint32_t j = i + 1; j < n; ++j) SWr(rt + i * N8 + j, SRd(rc + j * N8 + i));
+            }
+            FenceA();
+            Store(wsMem[wsAT], rt, 1, n * N8, N8, N8);
+            FenceA();
+        } else {
             const uint32_t spreadLen = 8 * N8;
             const uint32_t buf = kFree;
             FenceA();

@@ -9,7 +9,8 @@
 //   - copies of one queue are ordered among themselves, and the scalar unit is ordered with itself;
 //   - everything else (vector after vector, copy after vector or scalar, vector or scalar after copy, vector after a
 //     scalar write, opposite copy queues on EXTMEM) must be separated by a fence that completes the earlier access.
-// Read-after-write, write-after-write and write-after-read on SPAD floats and EXTMEM floats are checked.
+// Read-after-write, write-after-write and write-after-read on SPAD floats and EXTMEM floats are checked, and so are
+// vector instructions whose destination partially overlaps a source.
 #pragma once
 
 #include <cstdint>
@@ -170,6 +171,19 @@ inline void Gm(int u, const uint8_t *p, uint32_t bytes, bool write) {
 namespace mls_trace {
 
 void Vec(uint32_t dst, uint32_t count, uint32_t src0, uint32_t src1) {
+    // A vector instruction may update its operand in place (same start), but a destination that partially overlaps a
+    // source is not a supported operand layout on the device.
+    for (uint32_t src : {src0, src1}) {
+        if (src == 0xFFFFFFFFu || src == dst) continue;
+        if (src < dst + count && dst < src + count) {
+            tracechk::State &s = tracechk::St();
+            ++s.hazards;
+            if (s.reports++ < 12) {
+                std::fprintf(stderr, "[hazard] partially overlapping vector operands: dst %u, src %u, count %u (phase %s)\n",
+                             dst, src, count, s.phase.c_str());
+            }
+        }
+    }
     tracechk::Spad(tracechk::kV, dst, count, src0, src1, count);
 }
 
