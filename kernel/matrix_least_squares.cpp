@@ -66,6 +66,8 @@ constexpr uint32_t kNone = 0xFFFFFFFFu;
 constexpr uint32_t kScalarTransposeRows = 64;
 // Problems with at most this many rows whose working set fits in SPAD take the SPAD-resident path.
 constexpr uint32_t kResidentMaxRows = 256;
+// Row-oriented QR in SPAD (resident path, and the medium path whose [A | B] fits in SPAD) for at most this many rows.
+constexpr uint32_t kRowQrMaxRows = 640;
 constexpr float kSplit = 4097.0f;  // 2^12 + 1: Veltkamp split of a float into two 12-bit halves
 
 // Persistent SPAD area (float offsets).
@@ -127,11 +129,14 @@ public:
         InitConstants();
 
         const bool resident = PlanResident();
+        const bool medium = !resident && PlanMedium();
         for (uint32_t t = core; t < tiles; t += cores) {
             const uint32_t b1 = mls::Min((t + 1) * unit, batch_size);
             for (uint32_t b = t * unit; b < b1; ++b) {
                 if (resident) {
                     SolveResident(b);
+                } else if (medium) {
+                    SolveMedium(b);
                 } else {
                     SolveOne(b);
                 }
@@ -523,8 +528,9 @@ private:
         FenceA();
     }
 
-    // Solves R^T h = g: g rows at `gv` are consumed, h rows written to `hv`. Rows of R (zero left of and on the
-    // diagonal) come from the R^T area (AT, rows N8 apart).
+    // Solves R^T h = g: g rows at `gv` are consumed, h rows written to `hv`. Rows of R come either from the R^T area
+    // (AT, rows N8 apart, zero left of and on the diagonal) or, when rRowsInVf is set, from VF row i past its diagonal
+    // (rows M8 apart; the first used block is masked).
     SIMD_FN inline void ForwardSolve(uint32_t gv, uint32_t hv, uint32_t tmp, uint32_t cnt, uint32_t rbuf, uint32_t gr) {
         VFill(hv, 0.0f, cnt * N8);
         uint32_t hi = 0;  // R rows [lo, hi) are in rbuf
@@ -534,8 +540,20 @@ private:
                 lo = i;
                 hi = mls::Min(n, i + gr);
                 FenceA();
-                Load(rbuf, wsMem[wsAT + static_cast<uint64_t>(lo) * N8], 1, (hi - lo) * N8, N8, N8);
-                FenceA();
+                if (rRowsInVf) {
+                    Load(rbuf, wsMem[wsVF + static_cast<uint64_t>(lo) * M8], hi - lo, N8, M8, N8);
+                    FenceA();
+                    for (uint32_t j = lo; j < hi; ++j) {
+                        const uint32_t a = (j + 1) & ~7u;
+                        if (((j + 1) & 7u) != 0 && a < N8) {
+                            const uint32_t blkOff = rbuf + (j - lo) * N8 + a;
+                            VMul(blkOff, blkOff, mls::kMaskHi + ((j + 1) - a) * 8, 8);
+                        }
+                    }
+                } else {
+                    Load(rbuf, wsMem[wsAT + static_cast<uint64_t>(lo) * N8], 1, (hi - lo) * N8, N8, N8);
+                    FenceA();
+                }
             }
             FenceV();
             const float aii = SRd(mls::kAlpha + i);
@@ -774,9 +792,9 @@ private:
     // rcol [n][N8] = R columns (zero from the diagonal down), the k-row vector sets xa, x0, xb, tmp ([k][N8] each),
     // and the refinement working set.
     SIMD_FN inline bool PlanResident() {
-        if (m > mls::kResidentMaxRows) return false;
         K8 = mls::Pad8(k);
         Wr = N8 + K8;
+        if (m > mls::kResidentMaxRows) return false;
         rAug = kFree;
         rArow = rAug + m * Wr;
         rBrow = rArow + m * N8;
@@ -802,16 +820,18 @@ private:
         return rKg >= 1;
     }
 
-    // Row-oriented Householder QR of aug's first n columns, applied to all of aug.
-    SIMD_FN inline void ResidentQR() {
+    // Row-oriented Householder QR of the first n columns of the m x wr row-major matrix at `aug`, applied to all of
+    // it. Products for w = v^T aug go through `T` (`chunk` rows of wr floats) and are halved across rows, partial
+    // sums of several chunks collect in `wacc`; `wrow` holds tau * w. R ends up in rows 0..n-1 (diagonal in kAlpha).
+    SIMD_FN inline void RowQR(uint32_t aug, uint32_t wr, uint32_t T, uint32_t chunk, uint32_t wacc, uint32_t wrow) {
         for (uint32_t p = 0; p < n; ++p) {
             const uint32_t len0 = m - p;
             const uint32_t ap = p & ~7u;
-            const uint32_t wa = Wr - ap;
+            const uint32_t wa = wr - ap;
             FenceV();
             float nrm2 = 0.0f;
             for (uint32_t i = 0; i < len0; ++i) {
-                const float x = SRd(rAug + (p + i) * Wr + p);
+                const float x = SRd(aug + (p + i) * wr + p);
                 vsc[i] = x;
                 nrm2 += x * x;
             }
@@ -822,22 +842,40 @@ private:
             const float tau = 1.0f / (nrm * (nrm + axp));
             vsc[0] = xp - alpha;
             SWr(mls::kAlpha + p, alpha);
-            // w = v^T aug[p:m, ap:Wr): products per row, then halving across rows.
-            for (uint32_t i = 0; i < len0; ++i) VMulS(rQrT + i * Wr + ap, rAug + (p + i) * Wr + ap, vsc[i], wa);
-            FenceV();
-            for (uint32_t len = len0; len > 1;) {
-                const uint32_t h = (len + 1) / 2;
-                VAdd(rQrT + ap, rQrT + ap, rQrT + h * Wr + ap, (len - h) * Wr - ap);
+            // w = v^T aug[p:m, ap:wr): products per row, halved across rows.
+            const bool single = (len0 <= chunk);
+            for (uint32_t i0 = 0; i0 < len0; i0 += chunk) {
+                const uint32_t cl = mls::Min(chunk, len0 - i0);
+                for (uint32_t i = 0; i < cl; ++i) {
+                    VMulS(T + i * wr + ap, aug + (p + i0 + i) * wr + ap, vsc[i0 + i], wa);
+                }
                 FenceV();
-                len = h;
+                for (uint32_t len = cl; len > 1;) {
+                    const uint32_t h = (len + 1) / 2;
+                    VAdd(T + ap, T + ap, T + h * wr + ap, (len - h) * wr - ap);
+                    FenceV();
+                    len = h;
+                }
+                if (!single) {
+                    if (i0 == 0) {
+                        VMulS(wacc + ap, T + ap, 1.0f, wa);
+                    } else {
+                        VAdd(wacc + ap, wacc + ap, T + ap, wa);
+                    }
+                    FenceV();
+                }
             }
             // aug[p:m, :] -= v (tau w)^T over whole rows (tau w is zero left of ap).
-            if (ap > 0) VFill(rWrow, 0.0f, ap);
-            VMulS(rWrow + ap, rQrT + ap, tau, wa);
+            if (ap > 0) VFill(wrow, 0.0f, ap);
+            VMulS(wrow + ap, single ? T + ap : wacc + ap, tau, wa);
             FenceV();
-            for (uint32_t i = 0; i < len0; ++i) VMulS(rQrT + i * Wr, rWrow, vsc[i], Wr);
-            FenceV();
-            VSub(rAug + p * Wr, rAug + p * Wr, rQrT, len0 * Wr);
+            for (uint32_t i0 = 0; i0 < len0; i0 += chunk) {
+                const uint32_t cl = mls::Min(chunk, len0 - i0);
+                for (uint32_t i = 0; i < cl; ++i) VMulS(T + i * wr, wrow, vsc[i0 + i], wr);
+                FenceV();
+                VSub(aug + (p + i0) * wr, aug + (p + i0) * wr, T, cl * wr);
+                if (i0 + cl < len0) FenceV();
+            }
         }
         FenceV();
     }
@@ -975,7 +1013,7 @@ private:
         FenceA();
 
         MLS_TRACE_HOOK(Phase("r.qr"));
-        ResidentQR();
+        RowQR(rAug, Wr, rQrT, m, mls::kNone, rWrow);
 
         // A^T, B^T, R columns and c = (Q^T B)[0:n] as rows, on the scalar unit.
         MLS_TRACE_HOOK(Phase("r.setup"));
@@ -1044,7 +1082,73 @@ private:
 
         MLS_TRACE_HOOK(Phase("qr"));
         FactorAndApply();
+        rRowsInVf = false;
+        FinishStreaming(b, aOff);
+    }
 
+    // Medium problems: [A | B] fits in SPAD for a row-oriented QR (cheaper than the column-oriented one unless the
+    // matrix is much taller than wide), the rest streams like SolveOne. VF row j receives R column j left of the
+    // diagonal and R row j right of it, so no R^T pass is needed.
+    SIMD_FN inline bool PlanMedium() {
+        K8 = mls::Pad8(k);
+        Wr = N8 + K8;
+        if (m > mls::kRowQrMaxRows || m >= 8 * (n + k)) return false;
+        const uint32_t avail = mls::kSpadFloats - kFree;
+        const uint32_t augF = m * Wr;
+        if (augF + 2 * Wr + 8 * Wr > avail || augF + 8 * N8 + k * N8 > avail) return false;
+        mChunk = mls::Min(m, (avail - augF - 2 * Wr) / Wr);
+        return mChunk >= mls::Min(m, 8);
+    }
+
+    SIMD_FN inline void SolveMedium(uint32_t b) {
+        const uint64_t aOff = static_cast<uint64_t>(b) * m * n;
+        const uint64_t bOff = (b_has_batch != 0) ? static_cast<uint64_t>(b) * m * k : 0;
+        const uint32_t aug = kFree;
+        const uint32_t T = aug + m * Wr;
+        const uint32_t wacc = T + mChunk * Wr;
+        const uint32_t wrow = wacc + Wr;
+
+        MLS_TRACE_HOOK(Phase("m.qr"));
+        FenceA();
+        Load(aug, aMem[aOff], m, n, n, Wr);
+        Load(aug + N8, bMem[bOff], m, k, k, Wr);
+        FenceA();
+        RowQR(aug, Wr, T, mChunk, wacc, wrow);
+
+        // VF rows (R column j left of the diagonal, R row j right of it) in chunks, and the c rows of XT.
+        MLS_TRACE_HOOK(Phase("m.export"));
+        const uint32_t ct = T;
+        const uint32_t vfb = ct + k * N8;
+        const uint32_t vfRows = mls::Min(n, (mls::kSpadFloats - vfb) / N8);
+        VFill(ct, 0.0f, k * N8);
+        FenceV();
+        for (uint32_t r = 0; r < k; ++r) {
+            for (uint32_t j = 0; j < n; ++j) SWr(ct + r * N8 + j, SRd(aug + j * Wr + N8 + r));
+        }
+        FenceA();
+        Store(wsMem[wsXT], ct, 1, k * N8, N8, N8);
+        for (uint32_t j0 = 0; j0 < n; j0 += vfRows) {
+            const uint32_t j1 = mls::Min(n, j0 + vfRows);
+            FenceA();
+            for (uint32_t j = j0; j < j1; ++j) VMulS(vfb + (j - j0) * N8, aug + j * Wr, 1.0f, N8);
+            FenceV();
+            for (uint32_t j = j0; j < j1; ++j) {
+                for (uint32_t i = 0; i < j; ++i) SWr(vfb + (j - j0) * N8 + i, SRd(aug + i * Wr + j));
+            }
+            FenceA();
+            Store(wsMem[wsVF + static_cast<uint64_t>(j0) * M8], vfb, j1 - j0, N8, M8, N8);
+        }
+        FenceA();
+
+        MLS_TRACE_HOOK(Phase("transpose"));
+        TransposeToRows(wsMem, wsAT, M8, aMem, aOff, m, n, n, M8, kFree);
+        TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, k, M8, kFree);
+        rRowsInVf = true;
+        FinishStreaming(b, aOff);
+    }
+
+    // Solves, refinement and outputs of the streaming paths, from R in VF (+ diagonal), c in XT, A^T in AT, B^T in BT.
+    SIMD_FN inline void FinishStreaming(uint32_t b, uint64_t aOff) {
         // x0 = R^{-1} c, in groups of right-hand sides.
         MLS_TRACE_HOOK(Phase("solve0"));
         const uint32_t avail = mls::kSpadFloats - kFree;
@@ -1068,7 +1172,9 @@ private:
 
         // R^T rows (zero left of and on the diagonal) into AT, N8 apart: row i takes VF[j][i] for j > i.
         MLS_TRACE_HOOK(Phase("rtranspose"));
-        if (n <= mls::kScalarTransposeRows && 2 * n * N8 <= avail) {
+        if (rRowsInVf) {
+            // R rows are already in VF.
+        } else if (n <= mls::kScalarTransposeRows && 2 * n * N8 <= avail) {
             const uint32_t rc = kFree, rt = rc + n * N8;
             FenceA();
             Load(rc, wsMem[wsVF], n, N8, M8, N8);
@@ -1185,7 +1291,8 @@ private:
 
     uint32_t M8 = 0, N8 = 0, K8 = 0, Wr = 0, kTau = 0, kFree = 0;
     uint32_t rAug = 0, rArow = 0, rBrow = 0, rQrT = 0, rWrow = 0, rAt = 0, rBt = 0, rRcol = 0, rXa = 0, rX0 = 0, rXb = 0;
-    uint32_t rTmp = 0, rRef = 0, rSbT = 0, rSbA = 0, rKg = 0;
+    uint32_t rTmp = 0, rRef = 0, rSbT = 0, rSbA = 0, rKg = 0, mChunk = 0;
+    bool rRowsInVf = false;
     uint64_t wsAT = 0, wsVF = 0, wsBT = 0, wsXT = 0;
     bool flip = false;
     ScratchArena pipe;
@@ -1193,7 +1300,7 @@ private:
     Scratch<float> sp;
     float scal[mls::kMaxRhsGroup > mls::kMaxBlockCols ? mls::kMaxRhsGroup : mls::kMaxBlockCols];
     float dx[mls::kMaxRhsGroup], dxh[mls::kMaxRhsGroup], dxl[mls::kMaxRhsGroup], dy[mls::kMaxRhsGroup];
-    float vsc[mls::kResidentMaxRows];
+    float vsc[mls::kRowQrMaxRows];
 };
 
 template <typename DT_A>
