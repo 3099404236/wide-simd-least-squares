@@ -3,32 +3,43 @@
 // min_X ||A X - B||_F for A [m, n] (m >= n, full column rank, cond_2(A) <= 1e3) and B [m, k], batched.
 //
 // Method (per matrix):
-//   1. Householder QR of A in single precision, on the column-major copy A^T, left-looking in blocks of columns
-//      that fit in SPAD; the right-hand sides ride along as extra columns, giving c = Q^T B.
+//   1. Householder QR of [A | B] in single precision, giving R and c = Q^T B.
 //   2. x0 = R^{-1} c[0:n].
-//   3. One step of iterative refinement (corrected semi-normal equations) with the residual in double-float:
-//        r = B - A x0                 (exact products, error-free sums, rounded to float32 at the end)
-//        g = A^T r                    (same)
+//   3. One step of iterative refinement (corrected semi-normal equations) in double-float:
+//        r = B - A x0, kept as rh + rl
+//        g = A^T (rh + rl)
 //        x = x0 + R^{-1} R^{-T} g
-//      Single-precision QR alone misses the 1e-4 tolerance for cond(A) near 1e3 (the cond^2 * eps * ||r|| term of
-//      least squares); the refinement step brings the error down to the rounding of the result.
+//      Both products use Dot2 steps (Dekker's exact TwoProd, error-free TwoSum, about 45 bits): single-precision QR
+//      alone misses the 1e-4 tolerance for cond(A) near 1e3 (the cond^2 * eps * ||r|| term of least squares), and the
+//      error of g reaches x multiplied by cond(A)^2.
 //   4. residuals = ||r||^2 per right-hand side (m > n).
 //
+// Three ways through, chosen per shape (PlanResident, PlanMedium):
+//   - resident: the whole working set fits in SPAD (up to 256 rows). [A | B] is loaded once and factored by a
+//     row-oriented QR (reductions run across rows: no lane sums, one scalar read per row and step); everything after
+//     it reads SPAD.
+//   - medium: [A | B] fits in SPAD and the matrix is not much taller than wide: the same row-oriented QR, then R and
+//     c go to the workspace and the streaming solves and refinement follow.
+//   - streaming: column-oriented, left-looking blocked QR on A^T in the workspace (blocks of columns in SPAD,
+//     reflectors streamed back); dot products are halved to 8 lane partials that the scalar unit adds.
+//
 // Data layout: SPAD vector operands are 32 B aligned and vector instructions are element-wise, so lanes (index mod 8)
-// never mix in vector code. Column vectors are padded to M8 = Pad8(m) floats with zeros. Dot products are reduced by
-// halving to 8 lane partials, which the scalar unit adds. Transposes (A -> A^T, B -> B^T, R -> R^T) go through
-// EXTMEM with 4-byte block copies.
+// never mix in vector code. Vectors are padded to M8 = Pad8(m) or N8 = Pad8(n) floats with zeros. Transposes go
+// through the scalar unit when short and through EXTMEM with 4-byte block copies when long.
 //
 // Synchronization: a SIMD fence separates dependent vector instructions and precedes scalar reads of vector results;
 // a global fence separates block copies from the vector or scalar accesses that depend on them (both ways) and
-// follows scalar writes that vector code or block copies read.
+// follows scalar writes that vector code or block copies read. test/trace_checker.hpp verifies this placement.
 //
 // Work split: batches go out in tiles whose solution and residual outputs are whole 32 B blocks, so no two cores ever
-// write the same block; one core solves every batch of a tile in turn.
+// write the same block; one core solves every batch of a tile in turn. When tiles leave cores idle and k is a multiple
+// of 8, each tile goes to `helpers` cores (layout field set by the host): each redoes the QR of A and solves its own
+// groups of 8 right-hand sides, which own whole blocks of both outputs.
 //
-// Workspace slot of a working core (floats), as sized by host/matrix_least_squares.cpp:
+// Workspace slot of a working core (floats), as sized by host/matrix_least_squares.cpp (streaming and medium paths):
 //   AT [n][M8]  A^T, later R^T rows ([n][N8])
-//   VF [n][M8]  factored columns: R above the diagonal, the Householder vector from the diagonal down
+//   VF [n][M8]  factored columns: R above the diagonal, the Householder vector from the diagonal down (medium path:
+//               R column j left of the diagonal, R row j right of it)
 //   BT [k][M8]  B^T, then A^T r (first N8 floats)
 //   XT [k][N8]  Q^T B (first n rows), then x0, then x
 #include "simd_machine.hpp"
