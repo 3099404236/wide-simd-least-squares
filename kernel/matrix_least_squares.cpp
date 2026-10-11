@@ -61,9 +61,11 @@ constexpr uint32_t kSpadFloats = kSpadBytes / 4;
 constexpr uint32_t kMaxBlockCols = 64;  // columns per QR block (bounded by the scalar scratch below)
 constexpr uint32_t kMaxRhsGroup = 64;   // right-hand sides per refinement group
 constexpr uint32_t kNone = 0xFFFFFFFFu;
-// Transposes of at most this many rows go through the scalar unit (2 accesses of a few cycles per element) rather than
-// 4-byte block copies (two copies and a global fence per column, several hundred cycles).
-constexpr uint32_t kScalarTransposeRows = 128;
+// Transposes of at most this many rows go through the scalar unit (2 accesses of a few cycles per element, 8 * rows
+// cycles per column) rather than 4-byte block copies (a spread copy per column and a compacting copy per batch).
+constexpr uint32_t kScalarTransposeRows = 64;
+// Problems with at most this many rows whose working set fits in SPAD take the SPAD-resident path.
+constexpr uint32_t kResidentMaxRows = 256;
 constexpr float kSplit = 4097.0f;  // 2^12 + 1: Veltkamp split of a float into two 12-bit halves
 
 // Persistent SPAD area (float offsets).
@@ -124,9 +126,16 @@ public:
         sp = spadBlk.Get<float>();
         InitConstants();
 
+        const bool resident = PlanResident();
         for (uint32_t t = core; t < tiles; t += cores) {
             const uint32_t b1 = mls::Min((t + 1) * unit, batch_size);
-            for (uint32_t b = t * unit; b < b1; ++b) SolveOne(b);
+            for (uint32_t b = t * unit; b < b1; ++b) {
+                if (resident) {
+                    SolveResident(b);
+                } else {
+                    SolveOne(b);
+                }
+            }
         }
     }
 
@@ -755,6 +764,276 @@ private:
 
     // ------------------------------------------------------------------ one matrix
 
+    // ------------------------------------------------------------------ SPAD-resident path
+
+    // Small problems keep everything in SPAD: [A | B] is loaded once, factored in place by a row-oriented Householder
+    // QR (reductions run across rows, so they need no lane sums and only one scalar read per row and step), and every
+    // later phase reads SPAD instead of the workspace.
+    // Layout (float offsets): aug [m][Wr] = [A | B] rows (Wr = N8 + K8), arow [m][N8] = A, brow [m][K8] = B, then
+    // during the QR its scratch qrT [m][Wr] and wrow [Wr], afterwards at [n][M8] = A^T, bt [k][M8] = B^T,
+    // rcol [n][N8] = R columns (zero from the diagonal down), the k-row vector sets xa, x0, xb, tmp ([k][N8] each),
+    // and the refinement working set.
+    SIMD_FN inline bool PlanResident() {
+        if (m > mls::kResidentMaxRows) return false;
+        K8 = mls::Pad8(k);
+        Wr = N8 + K8;
+        rAug = kFree;
+        rArow = rAug + m * Wr;
+        rBrow = rArow + m * N8;
+        rQrT = rBrow + m * K8;
+        rWrow = rQrT + m * Wr;
+        if (rWrow + Wr > mls::kSpadFloats) return false;
+        rAt = rQrT;
+        rBt = rAt + n * M8;
+        rRcol = rBt + k * M8;
+        rXa = rRcol + n * N8;
+        rX0 = rXa + k * N8;
+        rXb = rX0 + k * N8;
+        rTmp = rXb + k * N8;
+        rRef = rTmp + k * N8;
+        if (rRef + mls::Pad8(n * k) > mls::kSpadFloats) return false;
+        rSbT = mls::Min(n, 16);
+        rSbA = mls::Min(m, 16);
+        for (rKg = mls::Min(k, mls::kMaxRhsGroup); rKg >= 1; --rKg) {
+            const uint32_t needR = 9 * rKg * M8 + 2 * rSbT * M8;
+            const uint32_t needG = 2 * rKg * M8 + 8 * rKg * N8 + 2 * rSbA * N8;
+            if (rRef + (needR > needG ? needR : needG) <= mls::kSpadFloats) break;
+        }
+        return rKg >= 1;
+    }
+
+    // Row-oriented Householder QR of aug's first n columns, applied to all of aug.
+    SIMD_FN inline void ResidentQR() {
+        for (uint32_t p = 0; p < n; ++p) {
+            const uint32_t len0 = m - p;
+            const uint32_t ap = p & ~7u;
+            const uint32_t wa = Wr - ap;
+            FenceV();
+            float nrm2 = 0.0f;
+            for (uint32_t i = 0; i < len0; ++i) {
+                const float x = SRd(rAug + (p + i) * Wr + p);
+                vsc[i] = x;
+                nrm2 += x * x;
+            }
+            const float nrm = hpc::sqrt(nrm2);
+            const float xp = vsc[0];
+            const float alpha = (xp >= 0.0f) ? -nrm : nrm;
+            const float axp = (xp >= 0.0f) ? xp : -xp;
+            const float tau = 1.0f / (nrm * (nrm + axp));
+            vsc[0] = xp - alpha;
+            SWr(mls::kAlpha + p, alpha);
+            // w = v^T aug[p:m, ap:Wr): products per row, then halving across rows.
+            for (uint32_t i = 0; i < len0; ++i) VMulS(rQrT + i * Wr + ap, rAug + (p + i) * Wr + ap, vsc[i], wa);
+            FenceV();
+            for (uint32_t len = len0; len > 1;) {
+                const uint32_t h = (len + 1) / 2;
+                VAdd(rQrT + ap, rQrT + ap, rQrT + h * Wr + ap, (len - h) * Wr - ap);
+                FenceV();
+                len = h;
+            }
+            // aug[p:m, :] -= v (tau w)^T over whole rows (tau w is zero left of ap).
+            if (ap > 0) VFill(rWrow, 0.0f, ap);
+            VMulS(rWrow + ap, rQrT + ap, tau, wa);
+            FenceV();
+            for (uint32_t i = 0; i < len0; ++i) VMulS(rQrT + i * Wr, rWrow, vsc[i], Wr);
+            FenceV();
+            VSub(rAug + p * Wr, rAug + p * Wr, rQrT, len0 * Wr);
+        }
+        FenceV();
+    }
+
+    // Solves R x = c with R columns resident at rRcol (zero from the diagonal down): c rows at `cv` are consumed,
+    // x rows written to `xv`.
+    SIMD_FN inline void BackSolveResident(uint32_t cv, uint32_t xv, uint32_t tmp, uint32_t cnt) {
+        VFill(xv, 0.0f, cnt * N8);
+        for (uint32_t jj = n; jj-- > 0;) {
+            FenceV();
+            const float ajj = SRd(mls::kAlpha + jj);
+            for (uint32_t r = 0; r < cnt; ++r) {
+                scal[r] = SRd(cv + r * N8 + jj) / ajj;
+                SWr(xv + r * N8 + jj, scal[r]);
+            }
+            if (jj == 0) break;
+            const uint32_t len = mls::Pad8(jj);
+            for (uint32_t r = 0; r < cnt; ++r) VMulS(tmp + r * N8, rRcol + jj * N8, scal[r], len);
+            FenceV();
+            for (uint32_t r = 0; r < cnt; ++r) VSub(cv + r * N8, cv + r * N8, tmp + r * N8, len);
+        }
+        FenceA();
+    }
+
+    // Solves R^T h = g with R rows resident in aug (their entries left of and on the diagonal zeroed first): g rows at
+    // `gv` are consumed, h rows written to `hv`.
+    SIMD_FN inline void ForwardSolveResident(uint32_t gv, uint32_t hv, uint32_t tmp, uint32_t cnt) {
+        VFill(hv, 0.0f, cnt * N8);
+        for (uint32_t i = 0; i < n; ++i) {
+            FenceV();
+            const float aii = SRd(mls::kAlpha + i);
+            for (uint32_t r = 0; r < cnt; ++r) {
+                scal[r] = SRd(gv + r * N8 + i) / aii;
+                SWr(hv + r * N8 + i, scal[r]);
+            }
+            if (i + 1 == n) break;
+            const uint32_t a = (i + 1) & ~7u;
+            const uint32_t len = N8 - a;
+            const uint32_t rr = rAug + i * Wr + a;
+            for (uint32_t r = 0; r < cnt; ++r) VMulS(tmp + r * N8 + a, rr, scal[r], len);
+            FenceV();
+            for (uint32_t r = 0; r < cnt; ++r) VSub(gv + r * N8 + a, gv + r * N8 + a, tmp + r * N8 + a, len);
+        }
+        FenceA();
+    }
+
+    // Refinement products as in RefinePass, from the resident A^T (at), B^T (bt), x0 (x0) and A rows (arow); g goes to
+    // the rows at xb.
+    SIMD_FN inline void RefineResident() {
+        for (uint32_t r0 = 0; r0 < k; r0 += rKg) {
+            const uint32_t cnt = mls::Min(rKg, k - r0);
+            const uint32_t rArr = rRef;  // rh[r] at rArr + r * M8, rl[r] at rArr + (cnt + r) * M8
+            const uint32_t acc = rArr + 2 * cnt * M8;
+            {
+                const uint32_t ahv = acc + 7 * cnt * M8;
+                const uint32_t alv = ahv + rSbT * M8;
+                FenceV();
+                VMulS(acc, rBt + r0 * M8, 1.0f, cnt * M8);  // Sh = b
+                VFill(acc + 2 * cnt * M8, 0.0f, cnt * M8);  // Sl = 0
+                FenceV();
+                flip = false;
+                for (uint32_t c0 = 0; c0 < n; c0 += rSbT) {
+                    const uint32_t rows = mls::Min(rSbT, n - c0);
+                    SplitVec(rAt + c0 * M8, ahv, alv, rows * M8);
+                    for (uint32_t j = 0; j < rows; ++j) {
+                        for (uint32_t r = 0; r < cnt; ++r) {
+                            SetMultiplier(r, -SRd(rX0 + (r0 + r) * N8 + c0 + j), 0.0f);
+                        }
+                        Dot2(rAt + (c0 + j) * M8, ahv + j * M8, alv + j * M8, acc, cnt, M8, false);
+                    }
+                }
+            }
+            {
+                const uint32_t f = cnt * M8;
+                const uint32_t sh = acc + (flip ? f : 0), sl = acc + 2 * f, pp = acc + 3 * f, ee = acc + 4 * f;
+                const uint32_t tt = acc + 5 * f;
+                const uint32_t rh = rArr, rl = rArr + f;
+                VAdd(rh, sh, sl, f);
+                FenceV();
+                VSub(pp, rh, sh, f);
+                VMul(tt, rh, rh, f);
+                FenceV();
+                VSub(ee, rh, pp, f);
+                VSub(sl, sl, pp, f);
+                FenceV();
+                if (has_residuals != 0) Halve(tt, M8, 0, cnt, M8);
+                VSub(ee, sh, ee, f);
+                FenceV();
+                if (has_residuals != 0) {
+                    for (uint32_t r = 0; r < cnt; ++r) SWr(mls::kRes + r0 + r, LaneSum(tt + r * M8));
+                }
+                VAdd(rl, ee, sl, f);
+                FenceV();
+            }
+            {
+                const uint32_t gacc = rArr + 2 * cnt * M8;
+                const uint32_t ahv = gacc + 8 * cnt * N8;
+                const uint32_t alv = ahv + rSbA * N8;
+                VFill(gacc, 0.0f, 3 * cnt * N8);  // Sh, S2, Sl
+                FenceV();
+                flip = false;
+                for (uint32_t i0 = 0; i0 < m; i0 += rSbA) {
+                    const uint32_t rows = mls::Min(rSbA, m - i0);
+                    SplitVec(rArow + i0 * N8, ahv, alv, rows * N8);
+                    for (uint32_t i = 0; i < rows; ++i) {
+                        for (uint32_t r = 0; r < cnt; ++r) {
+                            SetMultiplier(r, SRd(rArr + r * M8 + i0 + i), SRd(rArr + (cnt + r) * M8 + i0 + i));
+                        }
+                        Dot2(rArow + (i0 + i) * N8, ahv + i * N8, alv + i * N8, gacc, cnt, N8, true);
+                    }
+                }
+                const uint32_t f = cnt * N8;
+                VAdd(rXb + r0 * N8, gacc + (flip ? f : 0), gacc + 2 * f, f);
+                FenceV();
+            }
+        }
+    }
+
+    SIMD_FN inline void SolveResident(uint32_t b) {
+        const uint64_t aOff = static_cast<uint64_t>(b) * m * n;
+        const uint64_t bOff = (b_has_batch != 0) ? static_cast<uint64_t>(b) * m * k : 0;
+
+        MLS_TRACE_HOOK(Phase("r.load"));
+        // Long columns of A and B are transposed through the workspace while SPAD past the inputs is still free.
+        const bool viaWs = (m > mls::kScalarTransposeRows);
+        if (viaWs) {
+            TransposeToRows(wsMem, wsAT, M8, aMem, aOff, m, n, n, M8, rQrT);
+            TransposeToRows(wsMem, wsBT, M8, bMem, bOff, m, k, k, M8, rQrT);
+        }
+        FenceA();
+        Load(rAug, aMem[aOff], m, n, n, Wr);
+        Load(rAug + N8, bMem[bOff], m, k, k, Wr);
+        Load(rArow, aMem[aOff], m, n, n, N8);
+        Load(rBrow, bMem[bOff], m, k, k, K8);
+        FenceA();
+
+        MLS_TRACE_HOOK(Phase("r.qr"));
+        ResidentQR();
+
+        // A^T, B^T, R columns and c = (Q^T B)[0:n] as rows, on the scalar unit.
+        MLS_TRACE_HOOK(Phase("r.setup"));
+        if (viaWs) {
+            VFill(rRcol, 0.0f, rRef - rRcol);
+            Load(rAt, wsMem[wsAT], 1, n * M8, M8, M8);
+            Load(rBt, wsMem[wsBT], 1, k * M8, M8, M8);
+            FenceA();
+        } else {
+            VFill(rAt, 0.0f, rRef - rAt);
+            FenceV();
+            for (uint32_t c = 0; c < n; ++c) {
+                for (uint32_t i = 0; i < m; ++i) SWr(rAt + c * M8 + i, SRd(rArow + i * N8 + c));
+            }
+            for (uint32_t r = 0; r < k; ++r) {
+                for (uint32_t i = 0; i < m; ++i) SWr(rBt + r * M8 + i, SRd(rBrow + i * K8 + r));
+            }
+        }
+        for (uint32_t j = 1; j < n; ++j) {
+            for (uint32_t i = 0; i < j; ++i) SWr(rRcol + j * N8 + i, SRd(rAug + i * Wr + j));
+        }
+        for (uint32_t r = 0; r < k; ++r) {
+            for (uint32_t j = 0; j < n; ++j) SWr(rXa + r * N8 + j, SRd(rAug + j * Wr + N8 + r));
+        }
+        // R rows for the forward solve: zero the entries left of and on the diagonal in each row's first used block.
+        for (uint32_t i = 0; i + 1 < n; ++i) {
+            const uint32_t a = (i + 1) & ~7u;
+            if (((i + 1) & 7u) != 0) VMul(rAug + i * Wr + a, rAug + i * Wr + a, mls::kMaskHi + ((i + 1) - a) * 8, 8);
+        }
+        FenceA();
+
+        MLS_TRACE_HOOK(Phase("r.solve0"));
+        BackSolveResident(rXa, rX0, rTmp, k);
+
+        MLS_TRACE_HOOK(Phase("r.refine"));
+        RefineResident();
+
+        MLS_TRACE_HOOK(Phase("r.solve1"));
+        ForwardSolveResident(rXb, rXa, rTmp, k);
+        BackSolveResident(rXa, rXb, rTmp, k);
+        VAdd(rX0, rX0, rXb, k * N8);
+        FenceA();
+
+        MLS_TRACE_HOOK(Phase("r.output"));
+        const uint64_t xOff = static_cast<uint64_t>(b) * n * k;
+        if (k == 1) {
+            Store(solMem[xOff], rX0, 1, n, n, N8);
+        } else {
+            for (uint32_t c = 0; c < n; ++c) {
+                for (uint32_t r = 0; r < k; ++r) SWr(rRef + c * k + r, SRd(rX0 + r * N8 + c));
+            }
+            FenceA();
+            Store(solMem[xOff], rRef, 1, n * k, n * k, mls::Pad8(n * k));
+        }
+        if (has_residuals != 0) Store(resMem[static_cast<uint64_t>(b) * k], mls::kRes, 1, k, k, mls::Pad8(k));
+        FenceA();
+    }
+
     SIMD_FN inline void SolveOne(uint32_t b) {
         const uint64_t aOff = static_cast<uint64_t>(b) * m * n;
         const uint64_t bOff = (b_has_batch != 0) ? static_cast<uint64_t>(b) * m * k : 0;
@@ -904,7 +1183,9 @@ private:
     uint32_t m = 0, n = 0, k = 0, batch_size = 0, has_residuals = 0, b_has_batch = 0;
     MemRef<float> aMem, bMem, solMem, resMem, wsMem;
 
-    uint32_t M8 = 0, N8 = 0, kTau = 0, kFree = 0;
+    uint32_t M8 = 0, N8 = 0, K8 = 0, Wr = 0, kTau = 0, kFree = 0;
+    uint32_t rAug = 0, rArow = 0, rBrow = 0, rQrT = 0, rWrow = 0, rAt = 0, rBt = 0, rRcol = 0, rXa = 0, rX0 = 0, rXb = 0;
+    uint32_t rTmp = 0, rRef = 0, rSbT = 0, rSbA = 0, rKg = 0;
     uint64_t wsAT = 0, wsVF = 0, wsBT = 0, wsXT = 0;
     bool flip = false;
     ScratchArena pipe;
@@ -912,6 +1193,7 @@ private:
     Scratch<float> sp;
     float scal[mls::kMaxRhsGroup > mls::kMaxBlockCols ? mls::kMaxRhsGroup : mls::kMaxBlockCols];
     float dx[mls::kMaxRhsGroup], dxh[mls::kMaxRhsGroup], dxl[mls::kMaxRhsGroup], dy[mls::kMaxRhsGroup];
+    float vsc[mls::kResidentMaxRows];
 };
 
 template <typename DT_A>
