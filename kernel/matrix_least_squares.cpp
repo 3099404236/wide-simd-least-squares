@@ -245,8 +245,8 @@ private:
 
     // Transposes `cols` columns of a row-major matrix (`rows` x `ld`, starting at element `src`) into rows of `len`
     // floats (len >= rows, zero tail) at `dst`, `dstStride` floats apart. Short columns go through SPAD and the scalar
-    // unit (2 rows * cols accesses and two block copies); long ones through EXTMEM, one column at a time, with two
-    // 4-byte-block copies each (2 spread buffers of 8 * len floats at `buf`).
+    // unit (2 rows * cols accesses and two block copies); long ones through EXTMEM with 4-byte-block copies: each
+    // column is spread into lane 0 of 32 B blocks in SPAD, and a batch of them is compacted back in one copy.
     SIMD_FN inline void TransposeToRows(const MemRef<float> &dstMem, uint64_t dst, uint64_t dstStride,
                                         const MemRef<float> &srcMem, uint64_t src, uint32_t rows, uint32_t cols,
                                         uint32_t ld, uint32_t len, uint32_t buf) {
@@ -265,14 +265,23 @@ private:
             FenceA();
             return;
         }
-        const uint32_t spreadLen = 8 * len;
+        // Batches of wt columns: one spread copy per column into consecutive slots of 8 * len floats (zero beyond
+        // `rows` blocks), one compacting copy per batch; two batch buffers alternate.
+        const uint32_t slot = 8 * len;
+        uint32_t wt = (mls::kSpadFloats - buf) / (2 * slot);
+        if (wt > cols) wt = cols;
+        if (wt < 1) wt = 1;
+        const bool batched = (dstStride == len);
+        if (!batched) wt = 1;
         FenceA();
-        VFill(buf, 0.0f, 2 * spreadLen);
+        VFill(buf, 0.0f, 2 * wt * slot);
         FenceA();
-        for (uint32_t c = 0; c <= cols; ++c) {
-            if (c < cols) Spread(buf + (c & 1) * spreadLen, srcMem[src + c], rows, ld);
+        for (uint32_t c0 = 0, t = 0; c0 < cols; c0 += wt, ++t) {
+            const uint32_t cnt = mls::Min(wt, cols - c0);
+            const uint32_t bt = buf + (t & 1) * wt * slot;
+            for (uint32_t c = 0; c < cnt; ++c) Spread(bt + c * slot, srcMem[src + c0 + c], rows, ld);
             FenceA();
-            if (c < cols) Compact(dstMem[dst + static_cast<uint64_t>(c) * dstStride], buf + (c & 1) * spreadLen, len);
+            Compact(dstMem[dst + static_cast<uint64_t>(c0) * dstStride], bt, cnt * len);
         }
         FenceA();
     }
@@ -316,14 +325,44 @@ private:
     }
 
     // Applies H = I - tau v v^T (v at `v`, zero outside [a, m)) to columns blk + q * M8, q in [q0, q1), using the
-    // product rows prod + q * M8 as scratch.
-    SIMD_FN inline void ApplyReflector(uint32_t v, float tau, uint32_t a, uint32_t blk, uint32_t prod, uint32_t q0,
-                                       uint32_t q1) {
-        const uint32_t len = M8 - a;
+    // product rows prod + q * M8 as scratch. Long products are halved per row down to 128 floats, the next level
+    // writes 64 floats per row into the compact buffer `cmp` (two halves of 64 floats per row), and the last three
+    // levels each take one instruction over all rows.
+    SIMD_FN inline void ApplyReflector(uint32_t v, float tau, uint32_t a, uint32_t blk, uint32_t prod, uint32_t cmp,
+                                       uint32_t q0, uint32_t q1) {
+        uint32_t len = M8 - a;
+        const uint32_t nq = q1 - q0;
         for (uint32_t q = q0; q < q1; ++q) VMul(prod + q * M8 + a, v + a, blk + q * M8 + a, len);
         FenceV();
-        Halve(prod + q0 * M8, M8, a, q1 - q0, len);
-        for (uint32_t q = q0; q < q1; ++q) scal[q] = tau * LaneSum(prod + q * M8 + a);
+        if (len > 128) {
+            while (len > 128) {
+                uint32_t h = 64;
+                while (2 * h < len) h *= 2;
+                for (uint32_t q = q0; q < q1; ++q) {
+                    const uint32_t row = prod + q * M8 + a;
+                    VAdd(row, row, row + h, len - h);
+                }
+                FenceV();
+                len = h;
+            }
+            const uint32_t ca = cmp, cb = cmp + nq * 64, total = nq * 64;
+            for (uint32_t q = q0; q < q1; ++q) {
+                const uint32_t row = prod + q * M8 + a;
+                VAdd(ca + (q - q0) * 64, row, row + 64, 64);
+            }
+            FenceV();
+            VAdd(cb, ca, ca + 32, total - 32);
+            FenceV();
+            VAdd(ca, cb, cb + 16, total - 16);
+            FenceV();
+            VAdd(cb, ca, ca + 8, total - 8);
+            FenceV();
+            for (uint32_t q = q0; q < q1; ++q) scal[q] = tau * LaneSum(cb + (q - q0) * 64);
+        } else {
+            Halve(prod + q0 * M8, M8, a, nq, len);
+            for (uint32_t q = q0; q < q1; ++q) scal[q] = tau * LaneSum(prod + q * M8 + a);
+        }
+        len = M8 - a;
         for (uint32_t q = q0; q < q1; ++q) VMulS(prod + q * M8 + a, v + a, scal[q], len);
         FenceV();
         for (uint32_t q = q0; q < q1; ++q) VSub(blk + q * M8 + a, blk + q * M8 + a, prod + q * M8 + a, len);
@@ -334,7 +373,8 @@ private:
 
     // Factors column p (block column q): builds its Householder vector in `vcl` (and in place, from the diagonal
     // down), records R[p][p] and tau, and applies the reflector to block columns (q, wb).
-    SIMD_FN inline void FactorColumn(uint32_t p, uint32_t q, uint32_t wb, uint32_t blk, uint32_t prod, uint32_t vcl) {
+    SIMD_FN inline void FactorColumn(uint32_t p, uint32_t q, uint32_t wb, uint32_t blk, uint32_t prod, uint32_t vcl,
+                                     uint32_t cmp) {
         const uint32_t a = p & ~7u;
         const uint32_t len = M8 - a;
         const uint32_t col = blk + q * M8;
@@ -358,7 +398,7 @@ private:
         VSub(vcl + a, vcl + a, mls::kTmp8, 8);
         VSub(col + a, col + a, mls::kTmp8, 8);
         FenceV();
-        if (q + 1 < wb) ApplyReflector(vcl, tau, a, blk, prod, q + 1, wb);
+        if (q + 1 < wb) ApplyReflector(vcl, tau, a, blk, prod, cmp, q + 1, wb);
     }
 
     // Left-looking blocked Householder QR of [A | B] (A^T rows in AT, B^T rows in BT). Writes the factored columns to
@@ -370,7 +410,7 @@ private:
         uint32_t w = 0;
         while (true) {
             const uint32_t fixed = (1 + 2 * g) * M8;
-            w = (avail > fixed) ? (avail - fixed) / (2 * M8) : 0;
+            w = (avail > fixed) ? (avail - fixed) / (2 * M8 + 128) : 0;
             if (w >= 2 || g == 1) break;
             --g;
         }
@@ -380,6 +420,7 @@ private:
         const uint32_t vbuf = vcl + M8;
         const uint32_t blk = vbuf + 2 * g * M8;
         const uint32_t prod = blk + w * M8;
+        const uint32_t cmp = prod + w * M8;  // 2 x w x 64 floats
 
         for (uint32_t c0 = 0; c0 < total; c0 += w) {
             const uint32_t c1 = mls::Min(c0 + w, total);
@@ -419,12 +460,12 @@ private:
                     FenceV();
                     for (uint32_t j = 0; j < gp; ++j) {
                         const uint32_t p = p0 + j;
-                        ApplyReflector(cur + j * M8, SRd(kTau + p), p & ~7u, blk, prod, 0, wb);
+                        ApplyReflector(cur + j * M8, SRd(kTau + p), p & ~7u, blk, prod, cmp, 0, wb);
                     }
                 }
             }
 
-            for (uint32_t q = 0; q < na; ++q) FactorColumn(c0 + q, q, wb, blk, prod, vcl);
+            for (uint32_t q = 0; q < na; ++q) FactorColumn(c0 + q, q, wb, blk, prod, vcl, cmp);
 
             FenceA();
             if (na > 0) Store(wsMem[wsVF + static_cast<uint64_t>(c0) * M8], blk, 1, na * M8, na * M8, na * M8);
@@ -580,32 +621,33 @@ private:
     //   g = A^T (rh + rl) over N8-long vectors (A rows from the input), written over the B^T rows.
     // Both in Dot2 double-float. Rounding r to float32 before forming g would leave an error A^+ (r - fl(r)) in x, up
     // to cond(A) * eps * ||r||, so r stays in two parts.
-    // SPAD of a group of c right-hand sides: rh and rl rows (2c x M8), then either the residual accumulators (7 fields
-    // of c x M8), two blocks of ra A^T rows, their 12-bit halves and the x0 rows (c x N8), or the gradient accumulators
-    // (8 fields of c x N8), two blocks of rc A rows and their 12-bit halves.
+    // SPAD of a group of c right-hand sides. Residual: the accumulators (7 fields of c x M8) and the x0 rows (c x N8)
+    // at the end of SPAD, two blocks of ra A^T rows and their 12-bit halves from the start of the free area, where the
+    // r rows (rh and rl, 2c x M8) go once the last A^T row is used. Gradient: the r rows, the accumulators (8 fields of
+    // c x N8), two blocks of rc A rows and their 12-bit halves.
     SIMD_FN inline void RefinePass(uint64_t aOff) {
         const uint32_t avail = mls::kSpadFloats - kFree;
         uint32_t kg = mls::Min(k, mls::kMaxRhsGroup);
         uint32_t ra = 1, rc = 1;
         for (; kg >= 1; --kg) {
-            const uint32_t needR = 9 * kg * M8 + kg * N8;
+            const uint32_t needR = 7 * kg * M8 + kg * N8;  // accumulators and x0 rows; A^T blocks go over the r rows
             const uint32_t needG = 2 * kg * M8 + 8 * kg * N8;
-            if (needR + 4 * M8 > avail || needG + 4 * N8 > avail) continue;
+            if (needR + 4 * M8 > avail || 2 * kg * M8 + needR > avail || needG + 4 * N8 > avail) continue;
             ra = mls::Min(mls::Min(n, 16), (avail - needR) / (4 * M8));
             rc = mls::Min(mls::Min(m, 64), (avail - needG) / (4 * N8));
-            if (kg == 1 || (ra >= mls::Min(n, 2) && rc >= mls::Min(m, 4))) break;
+            if (kg == 1 || (ra >= mls::Min(n, 4) && rc >= mls::Min(m, 8))) break;
         }
         for (uint32_t r0 = 0; r0 < k; r0 += kg) {
             const uint32_t cnt = mls::Min(kg, k - r0);
             const uint32_t rArr = kFree;  // rh[r] at rArr + r * M8, rl[r] at rArr + (cnt + r) * M8
-            const uint32_t acc = rArr + 2 * cnt * M8;
+            const uint32_t xb = mls::kSpadFloats - cnt * N8;
+            const uint32_t acc = xb - 7 * cnt * M8;
 
             // --- r = B - A x0.
             {
-                const uint32_t raw = acc + 7 * cnt * M8;  // two blocks of ra A^T rows
+                const uint32_t raw = kFree;  // two blocks of ra A^T rows, then their 12-bit halves
                 const uint32_t ahv = raw + 2 * ra * M8;
                 const uint32_t alv = ahv + ra * M8;
-                const uint32_t xb = alv + ra * M8;
                 FenceA();
                 VFill(acc, 0.0f, 7 * cnt * M8);
                 FenceA();
@@ -654,12 +696,13 @@ private:
                 FenceV();
             }
 
-            // --- g = A^T (rh + rl).
+            // --- g = A^T (rh + rl), accumulators after the r rows.
             {
-                const uint32_t raw = acc + 8 * cnt * N8;  // two blocks of rc A rows
+                const uint32_t gacc = rArr + 2 * cnt * M8;
+                const uint32_t raw = gacc + 8 * cnt * N8;  // two blocks of rc A rows
                 const uint32_t ahv = raw + 2 * rc * N8;
                 const uint32_t alv = ahv + rc * N8;
-                VFill(acc, 0.0f, 8 * cnt * N8);
+                VFill(gacc, 0.0f, 8 * cnt * N8);
                 FenceA();
                 Load(raw, aMem[aOff], mls::Min(rc, m), n, n, N8);
                 flip = false;
@@ -677,16 +720,37 @@ private:
                         for (uint32_t r = 0; r < cnt; ++r) {
                             SetMultiplier(r, SRd(rArr + r * M8 + i0 + i), SRd(rArr + (cnt + r) * M8 + i0 + i));
                         }
-                        Dot2(cur + i * N8, ahv + i * N8, alv + i * N8, acc, cnt, N8, true);
+                        Dot2(cur + i * N8, ahv + i * N8, alv + i * N8, gacc, cnt, N8, true);
                     }
                 }
                 const uint32_t f = cnt * N8;
-                VAdd(acc + 3 * f, acc + (flip ? f : 0), acc + 2 * f, f);  // g = Sh + Sl into the P field
+                VAdd(gacc + 3 * f, gacc + (flip ? f : 0), gacc + 2 * f, f);  // g = Sh + Sl into the P field
                 FenceA();
-                Store(wsMem[wsBT + static_cast<uint64_t>(r0) * M8], acc + 3 * f, cnt, N8, M8, N8);
+                Store(wsMem[wsBT + static_cast<uint64_t>(r0) * M8], gacc + 3 * f, cnt, N8, M8, N8);
                 FenceA();
             }
         }
+    }
+
+    // Right-hand sides per group for triangular solves that keep `rows` vectors of N8 floats per right-hand side and
+    // stream R in blocks through the rest of SPAD, `solves` times per group: each group pays two fences per step and
+    // each block a pair of global fences and a copy, so this trades group count against block count.
+    SIMD_FN inline uint32_t SolveGroup(uint32_t rows, uint32_t solves) {
+        const uint32_t avail = mls::kSpadFloats - kFree;
+        uint32_t best = 1;
+        uint32_t bestCost = 0xFFFFFFFFu;
+        for (uint32_t kg = 1; kg <= mls::Min(k, mls::kMaxRhsGroup); ++kg) {
+            if ((rows * kg + 1) * N8 > avail) break;
+            const uint32_t gr = mls::Min(n, (avail - rows * kg * N8) / N8);
+            const uint32_t groups = (k + kg - 1) / kg;
+            const uint32_t blocks = (n + gr - 1) / gr;
+            const uint32_t cost = groups * solves * (2 * n * 20 + blocks * 700);
+            if (cost < bestCost) {
+                bestCost = cost;
+                best = kg;
+            }
+        }
+        return best;
     }
 
     // ------------------------------------------------------------------ one matrix
@@ -706,8 +770,7 @@ private:
         MLS_TRACE_HOOK(Phase("solve0"));
         const uint32_t avail = mls::kSpadFloats - kFree;
         {
-            uint32_t kg = mls::Min(k, mls::kMaxRhsGroup);
-            while (kg > 1 && 3 * kg * N8 + N8 > avail) --kg;
+            const uint32_t kg = SolveGroup(3, 1);
             const uint32_t gr = mls::Min(n, (avail - 3 * kg * N8) / N8);
             const uint32_t cv = kFree, xv = cv + kg * N8, tmp = xv + kg * N8, rbuf = tmp + kg * N8;
             for (uint32_t r0 = 0; r0 < k; r0 += kg) {
@@ -739,25 +802,28 @@ private:
             Store(wsMem[wsAT], rt, 1, n * N8, N8, N8);
             FenceA();
         } else {
-            const uint32_t spreadLen = 8 * N8;
+            // Batches of wt rows, descending; row i is spread into blocks (i, n) of its slot of 8 * N8 floats. A slot
+            // only ever holds rows of decreasing index, so the blocks left of a row's first entry stay zero.
+            const uint32_t slot = 8 * N8;
             const uint32_t buf = kFree;
+            uint32_t wt = (mls::kSpadFloats - buf) / (2 * slot);
+            if (wt > n) wt = n;
+            if (wt < 1) wt = 1;
             FenceA();
-            VFill(buf, 0.0f, 2 * spreadLen);
+            VFill(buf, 0.0f, 2 * wt * slot);
             FenceA();
-            // Descending rows: each buffer only ever gains nonzero blocks at or right of the rows it already held.
-            for (uint32_t t = 0; t <= n; ++t) {
-                if (t < n) {
-                    const uint32_t i = n - 1 - t;
+            for (uint32_t hi = n, t = 0; hi > 0; ++t) {
+                const uint32_t lo = (hi > wt) ? hi - wt : 0;
+                const uint32_t bt = buf + (t & 1) * wt * slot;
+                for (uint32_t i = lo; i < hi; ++i) {
                     if (i + 1 < n) {
-                        Spread(buf + (t & 1) * spreadLen + 8 * (i + 1), wsMem[wsVF + static_cast<uint64_t>(i + 1) * M8 + i],
+                        Spread(bt + (i - lo) * slot + 8 * (i + 1), wsMem[wsVF + static_cast<uint64_t>(i + 1) * M8 + i],
                                n - 1 - i, M8);
                     }
                 }
                 FenceA();
-                if (t < n) {
-                    const uint32_t i = n - 1 - t;
-                    Compact(wsMem[wsAT + static_cast<uint64_t>(i) * N8], buf + (t & 1) * spreadLen, N8);
-                }
+                Compact(wsMem[wsAT + static_cast<uint64_t>(lo) * N8], bt, (hi - lo) * N8);
+                hi = lo;
             }
             FenceA();
         }
@@ -765,8 +831,7 @@ private:
         // x = x0 + R^{-1} R^{-T} g.
         MLS_TRACE_HOOK(Phase("solve1"));
         {
-            uint32_t kg = mls::Min(k, mls::kMaxRhsGroup);
-            while (kg > 1 && 4 * kg * N8 + N8 > avail) --kg;
+            const uint32_t kg = SolveGroup(4, 2);
             const uint32_t gr = mls::Min(n, (avail - 4 * kg * N8) / N8);
             const uint32_t gv = kFree, hv = gv + kg * N8, tmp = hv + kg * N8, xv = tmp + kg * N8, rbuf = xv + kg * N8;
             for (uint32_t r0 = 0; r0 < k; r0 += kg) {
