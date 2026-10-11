@@ -9,7 +9,12 @@
 //
 // Usage:
 //   sim_harness                      run the built-in suite
-//   sim_harness m n k batch [cond] [seed] [b_has_batch] [cores]
+//   sim_harness sweep count [seed]   run `count` random shapes
+//   sim_harness m n k batch [cond] [seed] [b_has_batch] [cores] [spectrum]   one case, with a per-phase cost breakdown
+//                                    (spectrum: 0 linear, 1 geometric, 2 clustered at 1/cond, 3 clustered at 1)
+//
+// The kernel is built with MLS_TRACE: test/trace_checker.hpp checks its fence placement against the device's
+// asynchronous units and splits its cost counters by phase.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -17,10 +22,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "simd_machine.hpp"
 using namespace hpc;
+#define MLS_TRACE
+#include "trace_checker.hpp"
 #include "../kernel/matrix_least_squares.cpp"
 
 namespace {
@@ -62,8 +71,21 @@ void Orthonormalize(std::vector<double> &q, int rows, int cols) {
     }
 }
 
-// A = U diag(s) V^T with s linearly spaced from 1 to 1/cond, as test/verify_local.py does. Row-major m x n float32.
-std::vector<float> MakeMatrix(int m, int n, double cond, Rng &rng) {
+// Singular value p of n for condition number `cond`: spectrum 0 is linear from 1 to 1/cond (test/verify_local.py),
+// 1 geometric, 2 one value at 1 and the rest at 1/cond, 3 one value at 1/cond and the rest at 1.
+double Singular(int p, int n, double cond, int spectrum) {
+    if (n == 1) return 1.0;
+    const double t = static_cast<double>(p) / (n - 1);
+    switch (spectrum) {
+        case 1: return std::pow(cond, -t);
+        case 2: return p == 0 ? 1.0 : 1.0 / cond;
+        case 3: return p == n - 1 ? 1.0 / cond : 1.0;
+        default: return 1.0 + (1.0 / cond - 1.0) * t;
+    }
+}
+
+// A = U diag(s) V^T with random orthonormal U, V. Row-major m x n float32.
+std::vector<float> MakeMatrix(int m, int n, double cond, int spectrum, Rng &rng) {
     std::vector<double> u(static_cast<size_t>(m) * n), v(static_cast<size_t>(n) * n);
     for (auto &x : u) x = rng.Normal();
     for (auto &x : v) x = rng.Normal();
@@ -74,7 +96,7 @@ std::vector<float> MakeMatrix(int m, int n, double cond, Rng &rng) {
     for (int i = 0; i < m; ++i) {
         std::fill(row.begin(), row.end(), 0.0);
         for (int p = 0; p < n; ++p) {
-            const double s = (n == 1) ? 1.0 : 1.0 + (1.0 / cond - 1.0) * p / (n - 1);
+            const double s = Singular(p, n, cond, spectrum);
             const double up = u[static_cast<size_t>(p) * m + i] * s;
             const double *vp = &v[static_cast<size_t>(p) * n];  // column p of V
             for (int c = 0; c < n; ++c) row[c] += up * vp[c];
@@ -188,11 +210,14 @@ struct Case {
     uint64_t seed;
     int b_has_batch;  // -1: batched B when batch > 1
     int cores;
+    int spectrum = 0;
 };
 
 struct Result {
     double ratio_sol = 0, ratio_res = 0;
     uint64_t faults = 0;
+    uint64_t hazards = 0;
+    std::map<std::string, simemu::Counters> phases;  // of the most expensive core
     simemu::Counters worst;  // counters of the most expensive core
     double worst_cycles = 0, total_cycles = 0;
     int busy_cores = 0;
@@ -208,7 +233,7 @@ Result RunCase(const Case &cs, bool verbose) {
     const int b_count = b_has_batch ? batch : 1;
     std::vector<float> b(static_cast<size_t>(b_count) * m * k);
     for (int t = 0; t < batch; ++t) {
-        std::vector<float> at = MakeMatrix(m, n, cs.cond, rng);
+        std::vector<float> at = MakeMatrix(m, n, cs.cond, cs.spectrum, rng);
         std::copy(at.begin(), at.end(), a.begin() + static_cast<size_t>(t) * m * n);
     }
     for (auto &x : b) x = static_cast<float>(rng.Normal());
@@ -229,10 +254,14 @@ Result RunCase(const Case &cs, bool verbose) {
                                         static_cast<uint32_t>(batch), has_res ? 1u : 0u,
                                         static_cast<uint32_t>(b_has_batch)};
     Result r;
+    tracechk::St().hazards = 0;
+    tracechk::St().reports = 0;
     for (int c = 0; c < cs.cores; ++c) {
         simemu::BeginCore(c, cs.cores);
+        tracechk::BeginCore();
         const simemu::Counters before = simemu::g_cnt;
         matrix_least_squares<float>(ga, gb, gx, gr, gw, reinterpret_cast<MemAddr>(&layout));
+        tracechk::EndCore();
         const simemu::Counters d = Diff(simemu::g_cnt, before);
         const double cy = Cycles(d);
         r.total_cycles += cy;
@@ -240,9 +269,11 @@ Result RunCase(const Case &cs, bool verbose) {
         if (cy > r.worst_cycles) {
             r.worst_cycles = cy;
             r.worst = d;
+            r.phases = tracechk::St().phaseCost;
         }
     }
     r.faults = simemu::g_faults.total();
+    r.hazards = tracechk::St().hazards;
     r.spad_peak = simemu::g_spad_peak;
 
     std::vector<double> xr, rr;
@@ -251,9 +282,21 @@ Result RunCase(const Case &cs, bool verbose) {
         const float *bt = b.data() + (b_has_batch ? static_cast<size_t>(t) * m * k : 0);
         Reference(at, bt, m, n, k, xr, rr);
         const float *xo = reinterpret_cast<const float *>(gx) + static_cast<size_t>(t) * n * k;
+        double worst = 0;
+        int wi = 0;
         for (int i = 0; i < n * k; ++i) {
             const double e = std::fabs(static_cast<double>(xo[i]) - xr[i]) / (1e-4 + 1e-4 * std::fabs(xr[i]));
             if (!(e <= r.ratio_sol)) r.ratio_sol = std::isnan(e) ? INFINITY : e;
+            if (!(e <= worst)) {
+                worst = std::isnan(e) ? INFINITY : e;
+                wi = i;
+            }
+        }
+        if (verbose) {
+            double xmax = 0;
+            for (int i = 0; i < n * k; ++i) xmax = std::max(xmax, std::fabs(xr[i]));
+            std::printf("    batch %d: ratio %.3g at x[%d][%d] = %.9g (ref %.9g), max|x| %.3g\n", t, worst, wi / k, wi % k,
+                        xo[wi], xr[wi], xmax);
         }
         if (has_res) {
             const float *ro = reinterpret_cast<const float *>(gr) + static_cast<size_t>(t) * k;
@@ -269,21 +312,31 @@ Result RunCase(const Case &cs, bool verbose) {
                     (unsigned long long)w.vec_calls, (unsigned long long)w.vec_repeats, (unsigned long long)w.scalar_rd,
                     (unsigned long long)w.scalar_wr, (unsigned long long)w.dma_calls, (unsigned long long)w.dma_bytes,
                     (unsigned long long)w.fence_simd, (unsigned long long)w.fence_all);
+        std::printf("    %-11s %10s %9s %10s %9s %9s %7s %8s %6s\n", "phase", "cycles", "vec", "repeats", "scal_rd",
+                    "scal_wr", "dma", "f_simd", "f_all");
+        for (const auto &ph : r.phases) {
+            const auto &c = ph.second;
+            std::printf("    %-11s %10.0f %9llu %10llu %9llu %9llu %7llu %8llu %6llu\n", ph.first.c_str(), Cycles(c),
+                        (unsigned long long)c.vec_calls, (unsigned long long)c.vec_repeats,
+                        (unsigned long long)c.scalar_rd, (unsigned long long)c.scalar_wr,
+                        (unsigned long long)c.dma_calls, (unsigned long long)c.fence_simd,
+                        (unsigned long long)c.fence_all);
+        }
     }
     simemu::FreeRegions();
     return r;
 }
 
 void PrintHeader() {
-    std::printf("%5s %4s %3s %3s %5s %6s | %9s %9s %6s | %5s %12s %12s %7s\n", "m", "n", "k", "bat", "Bbat", "cond", "ratio_x",
-                "ratio_r", "faults", "cores", "cyc/core", "cyc_total", "spad");
+    std::printf("%5s %4s %3s %3s %5s %6s | %9s %9s %6s %7s | %5s %12s %12s\n", "m", "n", "k", "bat", "Bbat", "cond",
+                "ratio_x", "ratio_r", "faults", "hazards", "cores", "cyc/core", "cyc_total");
 }
 
 bool PrintRow(const Case &cs, const Result &r) {
-    const bool ok = r.faults == 0 && r.ratio_sol <= 1.0 && r.ratio_res <= 1.0;
-    std::printf("%5d %4d %3d %3d %5d %6.0f | %9.3g %9.3g %6llu | %5d %12.0f %12.0f %7zu %s\n", cs.m, cs.n, cs.k, cs.batch,
-                cs.b_has_batch, cs.cond, r.ratio_sol, r.ratio_res, (unsigned long long)r.faults, r.busy_cores,
-                r.worst_cycles, r.total_cycles, r.spad_peak, ok ? "ok" : "FAIL");
+    const bool ok = r.faults == 0 && r.hazards == 0 && r.ratio_sol <= 1.0 && r.ratio_res <= 1.0;
+    std::printf("%5d %4d %3d %3d %5d %6.0f | %9.3g %9.3g %6llu %7llu | %5d %12.0f %12.0f %s\n", cs.m, cs.n, cs.k,
+                cs.batch, cs.b_has_batch, cs.cond, r.ratio_sol, r.ratio_res, (unsigned long long)r.faults,
+                (unsigned long long)r.hazards, r.busy_cores, r.worst_cycles, r.total_cycles, ok ? "ok" : "FAIL");
     std::fflush(stdout);
     return ok;
 }
@@ -293,12 +346,28 @@ bool PrintRow(const Case &cs, const Result &r) {
 int main(int argc, char **argv) {
     std::vector<Case> cases;
     bool verbose = false;
-    if (argc >= 5) {
+    if (argc >= 3 && std::strcmp(argv[1], "sweep") == 0) {
+        const int count = std::atoi(argv[2]);
+        Rng pick(argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 7);
+        for (int i = 0; i < count; ++i) {
+            // Mostly small and medium shapes, some large ones.
+            const int mmax = (pick.Next() % 4 == 0) ? 1024 : 160;
+            const int m = 1 + static_cast<int>(pick.Next() % mmax);
+            const int nmax = std::min(m, 512);
+            const int n = 1 + static_cast<int>(pick.Next() % nmax);
+            const int k = 1 + static_cast<int>(pick.Next() % ((pick.Next() % 3 == 0) ? 64 : 8));
+            const int batch = 1 + static_cast<int>(pick.Next() % ((pick.Next() % 3 == 0) ? 32 : 4));
+            const int bb = (pick.Next() % 5 == 0) ? 0 : -1;
+            const double cond = (pick.Next() % 2) ? 1000.0 : 1.0 + static_cast<double>(pick.Next() % 1000);
+            cases.push_back(Case{m, n, k, batch, cond, pick.Next() % 100000, bb, 40});
+        }
+    } else if (argc >= 5) {
         Case c{std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3]), std::atoi(argv[4]), 1000.0, 1, -1, 40};
         if (argc > 5) c.cond = std::atof(argv[5]);
         if (argc > 6) c.seed = std::strtoull(argv[6], nullptr, 10);
         if (argc > 7) c.b_has_batch = std::atoi(argv[7]);
         if (argc > 8) c.cores = std::atoi(argv[8]);
+        if (argc > 9) c.spectrum = std::atoi(argv[9]);
         cases.push_back(c);
         verbose = true;
     } else {
