@@ -33,7 +33,7 @@ namespace simemu {
 
 constexpr size_t kSpadBytes = 195584;
 constexpr size_t kVecBytes = 256;
-// Limits the verified kernels respect on the device, enforced here as faults: no vector instruction over 256 elements
+// Limits the verified kernels respect on the device, enforced here as faults: vector instructions bounded by SPAD size
 // (matrix_linear_solve: "单次向量 mask 安全上限"), no single block copy over 32 KB.
 constexpr size_t kVecMaxElems = 65536;
 constexpr size_t kDmaMaxBytes = 196608;
@@ -319,7 +319,7 @@ template <typename T>
 inline void CountVec(uint64_t count) {
     if (count > simemu::kVecMaxElems) {
         ++simemu::g_faults.vec_long;
-        simemu::Report("vec_long", "vector instruction over 256 elements");
+        simemu::Report("vec_long", "vector instruction over limit");
     }
     ++simemu::g_cnt.vec_calls;
     simemu::g_cnt.vec_repeats += (count * sizeof(T) + simemu::kVecBytes - 1) / simemu::kVecBytes;
